@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+.qa/
+.npm-cache/
+release/
+AGENTS.md
+NOW.md
+TODO.md
+HANDOFF.md
+COMPLETED.md
+AUDIT-*.md
+.DS_Store
+Thumbs.db
+.env
+.env.*
