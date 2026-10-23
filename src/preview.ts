@@ -56,6 +56,31 @@ function safeImageLink(value: unknown): string | null {
   }
 }
 
+// HTML-fallback tables use native MathML so external readers need no custom
+// code-class convention. Internally, render their exact TeX through the same
+// bounded KaTeX path as normal Markdown math, without allowing new HTML tags.
+const restoreMathSources: Plugin<[], Root> = () => tree => {
+  const walk = (parent: Root | Element): void => {
+    const children = parent.children as RootContent[];
+    for (let index = 0; index < children.length; index += 1) {
+      const node = children[index];
+      if (node.type !== 'element') continue;
+      if (node.tagName === 'math') {
+        const semantics = node.children.find(child => child.type === 'element' && child.tagName === 'semantics');
+        const annotation = semantics?.type === 'element' ? semantics.children.find(child => child.type === 'element' && child.tagName === 'annotation' && child.properties.encoding === 'application/x-tex') : undefined;
+        if (annotation) {
+          const display = node.properties.display === 'block';
+          const code = element('code', [text(plainText(annotation))], { className: ['language-math', display ? 'math-display' : 'math-inline'] });
+          children[index] = display ? element('pre', [code]) : code;
+          continue;
+        }
+      }
+      walk(node);
+    }
+  };
+  walk(tree);
+};
+
 const hardenResources: Plugin<[{ diagnostics: Diagnostic[]; imageAssets?: Record<string, string> }], Root> = ({ diagnostics, imageAssets }) => {
   return (tree) => {
     let imageCount = 0;
@@ -136,6 +161,7 @@ export async function renderPreview(markdown: string, options: PreviewOptions = 
       .use(remarkMath, { singleDollarTextMath: true })
       .use(remarkRehype, { allowDangerousHtml: true })
       .use(rehypeRaw)
+      .use(restoreMathSources)
       .use(rehypeSanitize, previewSchema)
       .use(hardenResources, { diagnostics, imageAssets: options.imageAssets })
       .use(rehypeKatex, {

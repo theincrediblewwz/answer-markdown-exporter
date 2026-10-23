@@ -2,6 +2,7 @@ import { unified } from 'unified';
 import remarkStringify from 'remark-stringify';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
+import { renderToString } from 'katex';
 import type { Root } from 'mdast';
 import type { CodeRecord, Diagnostic, ExportResult, FormulaRecord } from './types';
 
@@ -84,6 +85,8 @@ function safeUrl(value: string, element: Element): string | null {
 }
 
 class Capture {
+  private mathHtmlCharacters = 0;
+  private mathHtmlCache = new Map<string, string>();
   diagnostics: Diagnostic[] = [];
   formulas: FormulaRecord[] = [];
   codeBlocks: CodeRecord[] = [];
@@ -423,7 +426,7 @@ class Capture {
       || headerRows.length > 1 || (headerRows.length === 1 && headerRows[0] !== sourceRows[0]);
     const needsFallback = complexSections || rows.some(row => row.some(cell => cell.colspan > 1 || cell.rowspan > 1 || cell.blocks.length > 1 || cell.blocks.some(block => block.type !== 'paragraph') || this.hasTableMathConflict(cell.blocks)));
     if (needsFallback) {
-      this.note('TABLE_HTML_FALLBACK', '复杂表格或表格中的数学源码无法无损写成 GFM 管道表格，已保存为安全 HTML 表格；外部阅读器支持可能不同。');
+      this.note('TABLE_HTML_FALLBACK', '复杂表格或含竖线等公式的表格已保存为安全 HTML；公式使用原生 MathML 并在 annotation 中保留 LaTeX 源码，阅读器需支持 HTML 和 MathML。');
       const rowHtml = (row: Cell[]): string => '<tr>' + row.map(cell => {
         const tag = cell.header ? 'th' : 'td';
         return `<${tag}${attrSpan('colspan', cell.colspan)}${attrSpan('rowspan', cell.rowspan)}${cell.align ? ` align="${cell.align}"` : ''}>${cell.blocks.map(part => this.html(part)).join('')}</${tag}>`;
@@ -455,6 +458,35 @@ class Capture {
     return nodes.some(node => (node.type === 'inlineMath' && /[|\r\n]/.test(node.value || '')) || node.type === 'math' || this.hasTableMathConflict(node.children || []));
   }
 
+  tableMath(node: Ast): string {
+    const tex = node.value || '';
+    const display = node.type === 'math';
+    const key = `${display ? 'block' : 'inline'}:${tex}`;
+    let markup = this.mathHtmlCache.get(key);
+    if (tex.length <= 20_000 && this.mathHtmlCharacters < 500_000) {
+      try {
+        if (!markup) {
+          const rendered = renderToString(tex, { output: 'mathml', displayMode: display, trust: false, throwOnError: true, strict: 'ignore', maxExpand: 1_000, maxSize: 30 });
+          markup = rendered.match(/<math\b[\s\S]*<\/math>/)?.[0];
+          if (!markup) throw new Error('Missing native math output');
+          // A numeric character reference retains CR through an HTML parser.
+          markup = markup.replace(/\r/g, '&#13;');
+          if (markup.length > 200_000) throw new Error('Native math output too large');
+        }
+        if (this.mathHtmlCharacters + markup.length > 500_000) {
+          this.mathHtmlCharacters = 500_000;
+          throw new Error('Native math budget exceeded');
+        }
+        this.mathHtmlCache.set(key, markup);
+        this.mathHtmlCharacters += markup.length;
+        return markup;
+      } catch { /* Keep exact, escaped TeX below when it cannot safely render. */ }
+    }
+    this.note('TABLE_MATH_SOURCE_FALLBACK', '有表格公式无法在安全限额内生成 MathML，已保留 LaTeX 源码；该公式在外部阅读器中可能显示为代码。');
+    const code = `<code class="language-math ${display ? 'math-display' : 'math-inline'}">${escapeHtml(tex)}</code>`;
+    return display ? `<pre>${code}</pre>` : code;
+  }
+
   /** Render only our own AST and selected attributes, never page-owned outerHTML. */
   html(node: Ast): string {
     const children = node.type === 'table' ? '' : (node.children || []).map(child => this.html(child)).join('');
@@ -467,8 +499,8 @@ class Capture {
       case 'delete': return `<del>${children}</del>`;
       case 'inlineCode': return `<code>${value}</code>`;
       case 'code': return `<pre><code${node.lang ? ` class="language-${escapeHtml(String(node.lang))}"` : ''}>${value}</code></pre>`;
-      case 'inlineMath': return `<code class="language-math math-inline">${value}</code>`;
-      case 'math': return `<pre><code class="language-math math-display">${value}</code></pre>`;
+      case 'inlineMath':
+      case 'math': return this.tableMath(node);
       case 'break': return '<br>';
       case 'thematicBreak': return '<hr>';
       case 'blockquote': return `<blockquote>${children}</blockquote>`;
