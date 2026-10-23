@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JSDOM } from 'jsdom';
-import { answerElements, answerContent, answerKey, generationState, isGenerating } from '../src/adapter';
+import { answerElements, answerContent, answerKey, cloneAnswerContent, generationState, isGenerating } from '../src/adapter';
 import { extractMarkdown } from '../src/extract';
 
 function withPage(html: string, run: (document: Document) => void): void {
@@ -216,5 +216,84 @@ test('busy state on a diagnosed conversation root stays local and clears when co
     assert.deepEqual(answers.map(answer => isGenerating(answer)), [true, false]);
     document.querySelector('#working')!.setAttribute('aria-busy', 'false');
     assert.deepEqual(answers.map(answer => isGenerating(answer)), [false, false]);
+  });
+});
+
+test('expanded modern thoughts and assistant headings never become export answers', () => {
+  withPage('<main><section data-turn-key="turn"><div data-talvt-turn-state="complete"><details open><summary>Thoughts</summary><div data-markdown-text-style="assistant-message" data-markdown-text-tone="secondary"><p>Intermediate reasoning</p></div><div data-markdown-text-style="assistant-message" data-markdown-text-tone="secondary"><p>Tool progress</p></div></details><div id="final" data-chatgpt-search-unit-key="reply:assistant"><h4 data-conversation-role="assistant">Assistant says:</h4><div data-markdown-text-style="assistant-message"><p>Final answer only</p></div></div></div></section></main>', document => {
+    assert.deepEqual(answerElements(), [document.querySelector('#final')]);
+    const result = extractMarkdown(cloneAnswerContent(answerElements()[0]));
+    assert.match(result.markdown, /Final answer only/);
+    assert.doesNotMatch(result.markdown, /Intermediate reasoning|Tool progress|Assistant says|Thoughts/);
+  });
+});
+
+test('the latest final candidate owns a turn while earlier stages stay excluded', () => {
+  withPage('<article data-turn-id="turn"><div data-message-author-role="assistant" data-message-id="stage">Intermediate status</div><div id="final" data-message-author-role="assistant" data-message-id="final"><p>Final body</p></div></article><article><div id="next" data-message-author-role="assistant">Separate answer</div></article>', document => {
+    assert.deepEqual(answerElements(), [document.querySelector('#final'), document.querySelector('#next')]);
+    assert.doesNotMatch(extractMarkdown(cloneAnswerContent(answerElements()[0])).markdown, /Intermediate status/);
+  });
+});
+
+test('modern turn state remains generating between chunks until explicit completion', () => {
+  withPage('<main><section data-talvt-turn-state="streaming"><div data-chatgpt-search-unit-key="reply:assistant"><p>Answer paused between chunks</p></div></section></main>', document => {
+    const answer = answerElements()[0];
+    assert.ok(answer);
+    assert.equal(isGenerating(answer), true, 'absence of a stop button is not completion');
+    document.querySelector('[data-talvt-turn-state]')!.setAttribute('data-talvt-turn-state', 'complete');
+    assert.equal(isGenerating(answer), false);
+  });
+});
+
+test('a new thoughts-only turn with a stop control does not block an older completed answer', () => {
+  withPage('<main><section data-talvt-turn-state="complete"><div id="old" data-chatgpt-search-unit-key="old:assistant">Old completed answer</div></section><section data-talvt-turn-state="thinking"><div data-markdown-text-style="assistant-message" data-markdown-text-tone="secondary">Thinking without a final body</div></section></main><button data-testid="stop-button">Stop</button>', document => {
+    assert.deepEqual(answerElements(), [document.querySelector('#old')]);
+    assert.equal(isGenerating(answerElements()[0]), false);
+  });
+});
+
+test('an empty pending modern turn scopes Stop away from an older completed answer', () => {
+  withPage('<main><section data-talvt-turn-state="complete"><div id="old" data-chatgpt-search-unit-key="old:assistant">Older completed answer</div></section><section data-talvt-turn-state="thinking"></section></main><button data-testid="stop-button">Stop</button>', document => {
+    assert.deepEqual(answerElements(), [document.querySelector('#old')]);
+    assert.equal(isGenerating(answerElements()[0]), false);
+  });
+});
+
+test('busy state on the owning turn is not hidden by an inner conversation role wrapper', () => {
+  withPage('<article aria-busy="true"><section data-conversation-role="assistant"><div data-assistant-markdown-root>Working</div></section></article>', document => {
+    const answer = answerElements()[0];
+    assert.equal(isGenerating(answer), true);
+    document.querySelector('article')!.removeAttribute('aria-busy');
+    assert.equal(isGenerating(answer), false);
+  });
+});
+
+test('busy state on an outer article also applies to its assistant transcript item', () => {
+  withPage('<article aria-busy="true"><ol><li data-message-role="assistant"><div data-assistant-markdown-root>Working answer</div></li></ol></article>', document => {
+    const answer = answerElements()[0];
+    assert.equal(isGenerating(answer), true);
+    document.querySelector('article')!.setAttribute('aria-busy', 'false');
+    assert.equal(isGenerating(answer), false);
+  });
+});
+
+test('an incomplete transcript item stays busy inside its article between output chunks', () => {
+  withPage('<article><li data-message-role="assistant" data-message-complete="false"><div data-assistant-markdown-root>Paused answer</div></li></article>', document => {
+    const answer = answerElements()[0];
+    assert.equal(isGenerating(answer), true);
+    document.querySelector('li')!.setAttribute('data-message-complete', '');
+    assert.equal(isGenerating(answer), false);
+  });
+});
+
+test('sibling Markdown roots in one transcript item retain all body fragments without transcript UI', () => {
+  withPage('<main><ol><li id="message" data-message-role="assistant" data-message-complete><h6>Assistant says:</h6><div data-assistant-markdown-root><p>First body fragment</p></div><aside data-message-channel="analysis"><div data-assistant-markdown-root>Private reasoning</div></aside><div data-assistant-markdown><pre><code class="language-python">if ready:\n    run()\n</code></pre><p>Last body fragment</p></div><div data-assistant-message-actions><button>Copy native action</button></div></li></ol></main>', document => {
+    const answers = answerElements();
+    assert.deepEqual(answers, [document.querySelector('#message')]);
+    const result = extractMarkdown(cloneAnswerContent(answers[0]));
+    assert.match(result.markdown, /First body fragment/);
+    assert.match(result.markdown, /Last body fragment/);
+    assert.equal(result.codeBlocks[0].text, 'if ready:\n    run()\n');
+    assert.doesNotMatch(result.markdown, /Assistant says|Private reasoning|Copy native action/);
   });
 });

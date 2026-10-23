@@ -154,11 +154,10 @@ test('repeated scheduled scans preserve a single existing export group', async (
   });
 });
 
-test('removing the streaming class re-enables export without unrelated DOM changes', async () => {
+test('removing the streaming class mounts export controls without unrelated DOM changes', async () => {
   await withController('<article><div data-message-author-role="assistant"><span id="stream" class="result-streaming">Answer in progress</span></div></article>', async (page, assertHealthy) => {
     await settle(page);
-    assertOneButtonGroup(page);
-    assert.ok(buttons(page).every(button => button.disabled), 'all export actions must be disabled during streaming');
+    assert.equal(controls(page).length, 0, 'streaming answers must not mount export controls');
     page.window.document.querySelector('#stream')!.classList.remove('result-streaming');
     await eventually(() => buttons(page).length === 4 && buttons(page).every(button => !button.disabled), assertHealthy, 'removing only the streaming class must restore export actions');
     assertOneButtonGroup(page);
@@ -218,17 +217,16 @@ test('legacy wrappers containing current roots and extension previews produce on
   });
 });
 
-test('current GPT roots disable and restore actions as root classes and descendant busy states change', async () => {
+test('current GPT roots remove and restore controls as streaming and busy states change', async () => {
   await withController('<main><ol><li data-message-role="assistant"><div data-assistant-markdown data-assistant-markdown-root class="result-streaming"><div id="body" aria-busy="false"><section><p data-d-component="text">Answer in progress</p></section></div></div></li></ol></main>', async (page, assertHealthy) => {
     await settle(page);
-    assertOneButtonGroup(page);
-    assert.ok(buttons(page).every(button => button.disabled));
+    assert.equal(controls(page).length, 0);
     page.window.document.querySelector('[data-assistant-markdown-root]')!.classList.remove('result-streaming');
     await eventually(() => buttons(page).length === 4 && buttons(page).every(button => !button.disabled), assertHealthy, 'removing the current root streaming class must enable export');
     page.window.document.querySelector('#body')!.setAttribute('aria-busy', 'true');
-    await eventually(() => buttons(page).every(button => button.disabled), assertHealthy, 'a busy descendant must disable export');
+    await eventually(() => controls(page).length === 0, assertHealthy, 'a busy descendant must remove export controls');
     page.window.document.querySelector('#body')!.setAttribute('aria-busy', 'false');
-    await eventually(() => buttons(page).every(button => !button.disabled), assertHealthy, 'a completed descendant must enable export again');
+    await eventually(() => buttons(page).length === 4 && buttons(page).every(button => !button.disabled), assertHealthy, 'a completed descendant must restore export controls');
     assertOneButtonGroup(page);
   });
 });
@@ -247,11 +245,10 @@ for (const attribute of ['data-assistant-markdown-root', 'data-assistant-markdow
   });
 }
 
-test('busy state on the current GPT transcript item disables controls until the item completes', async () => {
+test('busy state on the current GPT transcript item prevents controls until the item completes', async () => {
   await withController('<main><ol><li id="current-message" data-message-role="assistant" aria-busy="true"><div><div data-assistant-markdown data-assistant-markdown-root><div aria-busy="false"><section><p data-d-component="text">Answer in progress</p></section></div></div></div></li></ol></main>', async (page, assertHealthy) => {
     await settle(page);
-    assertOneButtonGroup(page);
-    assert.ok(buttons(page).every(button => button.disabled), 'a busy transcript item must disable its export actions');
+    assert.equal(controls(page).length, 0, 'a busy transcript item must not have export controls');
     page.window.document.querySelector('#current-message')!.setAttribute('aria-busy', 'false');
     await eventually(() => buttons(page).length === 4 && buttons(page).every(button => !button.disabled), assertHealthy, 'completing the transcript item must restore export actions');
     assertOneButtonGroup(page);
@@ -298,15 +295,107 @@ test('possibly nested diagnosed assistant markers and extension previews produce
 test('a diagnosed conversation root recovers from local busy state without disabling another answer', async () => {
   await withController('<main><section id="working" data-conversation-role="assistant" aria-busy="true"><div data-markdown-text-style="assistant-message"><p>Working answer</p></div></section><section data-conversation-role="assistant"><div data-chatgpt-search-unit-key="completed:assistant"><p>Completed answer</p></div></section></main>', async (page, assertHealthy) => {
     await settle(page);
-    assert.equal(controls(page).length, 2);
-    assert.ok(buttons(page).every(button => button.disabled));
-    const completedButtons = Array.from(controls(page)[1].shadowRoot!.querySelectorAll<HTMLButtonElement>('button'));
+    assert.equal(controls(page).length, 1);
+    assert.notEqual(controls(page)[0].previousElementSibling, page.window.document.querySelector('#working'));
+    const completedButtons = buttons(page);
     assert.equal(completedButtons.length, 4);
     assert.ok(completedButtons.every(button => !button.disabled));
     page.window.document.querySelector('#working')!.setAttribute('aria-busy', 'false');
-    await eventually(() => buttons(page).length === 4 && buttons(page).every(button => !button.disabled), assertHealthy, 'completing the diagnosed conversation root must restore its actions');
+    await eventually(() => controls(page).length === 2 && buttons(page).every(button => !button.disabled), assertHealthy, 'completing the diagnosed conversation root must restore its actions');
     assert.equal(controls(page).length, 2);
     assert.ok(completedButtons.every(button => !button.disabled));
+  });
+});
+
+test('expanding thoughts on a completed modern answer preserves its single export group', async () => {
+  await withController('<main><section data-turn-key="turn"><div data-talvt-turn-state="complete"><details open><summary>Thoughts</summary><div id="thoughts"></div></details><div id="final" data-chatgpt-search-unit-key="reply:assistant"><h4 data-conversation-role="assistant">Assistant says:</h4><div data-markdown-text-style="assistant-message"><p>Final answer</p></div></div></div></section></main>', async (page, assertHealthy) => {
+    assertOneButtonGroup(page);
+    const original = controls(page)[0];
+    for (let chunk = 0; chunk < 6; chunk++) {
+      const stage = page.window.document.createElement('div');
+      stage.setAttribute('data-markdown-text-style', 'assistant-message');
+      stage.setAttribute('data-markdown-text-tone', 'secondary');
+      stage.textContent = `Intermediate stage ${chunk}`;
+      page.window.document.querySelector('#thoughts')!.append(stage);
+      await settle(page);
+      assertHealthy();
+      assertOneButtonGroup(page);
+      assert.equal(controls(page)[0], original);
+      assert.equal(original.previousElementSibling, page.window.document.querySelector('#final'));
+    }
+  });
+});
+
+test('modern streamed chunks mount no controls until only the turn completion attribute changes', async () => {
+  await withController('<main><section id="turn" data-talvt-turn-state="streaming"><div id="stages"></div><div data-chatgpt-search-unit-key="reply:assistant"><p id="body">First chunk</p></div></section></main>', async (page, assertHealthy) => {
+    assert.equal(controls(page).length, 0, 'a pending modern answer without Stop is still incomplete');
+    for (let chunk = 0; chunk < 4; chunk++) {
+      const stage = page.window.document.createElement('div');
+      stage.setAttribute('data-markdown-text-style', 'assistant-message');
+      stage.textContent = `Stage ${chunk}`;
+      page.window.document.querySelector('#stages')!.append(stage);
+      page.window.document.querySelector('#body')!.textContent += ` chunk ${chunk}`;
+      await settle(page);
+      assert.equal(controls(page).length, 0);
+    }
+    page.window.document.querySelector('#turn')!.setAttribute('data-talvt-turn-state', 'complete');
+    await eventually(() => controls(page).length === 1, assertHealthy, 'completion attribute alone must mount the final actions');
+    assertOneButtonGroup(page);
+    assert.ok(buttons(page).every(button => !button.disabled));
+  });
+});
+
+test('a new thoughts-only generation keeps an older completed answer usable', async () => {
+  await withController('<main><section data-talvt-turn-state="complete"><div id="old" data-chatgpt-search-unit-key="old:assistant">Older completed answer</div></section><section data-talvt-turn-state="thinking"><div data-markdown-text-style="assistant-message" data-markdown-text-tone="secondary">Thinking without final output</div></section></main><button data-testid="stop-button">Stop</button>', async (page, assertHealthy) => {
+    await settle(page);
+    assertHealthy();
+    assertOneButtonGroup(page);
+    assert.equal(controls(page)[0].previousElementSibling, page.window.document.querySelector('#old'));
+    assert.ok(buttons(page).every(button => !button.disabled));
+    page.window.document.querySelector('[data-testid="stop-button"]')!.remove();
+    await settle(page);
+    assertOneButtonGroup(page);
+    assert.ok(buttons(page).every(button => !button.disabled));
+  });
+});
+
+test('regenerating a completed modern answer removes old controls and mounts one fresh group on completion', async () => {
+  await withController('<main><section id="turn" data-talvt-turn-state="complete"><div id="final" data-chatgpt-search-unit-key="reply:assistant"><p>First completed output</p></div></section></main>', async (page, assertHealthy) => {
+    const original = controls(page)[0];
+    page.window.document.querySelector('#turn')!.setAttribute('data-talvt-turn-state', 'streaming');
+    await eventually(() => controls(page).length === 0, assertHealthy, 'restarting generation must remove the old group');
+    assert.equal(original.isConnected, false);
+    page.window.document.querySelector('#final p')!.textContent = 'Regenerated final output';
+    await settle(page);
+    assert.equal(controls(page).length, 0);
+    page.window.document.querySelector('#turn')!.setAttribute('data-talvt-turn-state', 'complete');
+    await eventually(() => controls(page).length === 1, assertHealthy, 'finishing regeneration must mount one group');
+    assertOneButtonGroup(page);
+    assert.notEqual(controls(page)[0], original);
+  });
+});
+
+test('outer turn busy state prevents controls despite an inner conversation role wrapper', async () => {
+  await withController('<article id="turn" aria-busy="true"><section data-conversation-role="assistant"><div data-assistant-markdown-root>Answer in progress</div></section></article>', async (page, assertHealthy) => {
+    assert.equal(controls(page).length, 0);
+    page.window.document.querySelector('#turn')!.setAttribute('aria-busy', 'false');
+    await eventually(() => controls(page).length === 1, assertHealthy, 'clearing the outer busy state must enable export');
+    assertOneButtonGroup(page);
+  });
+});
+
+test('one copied answer preserves sibling Markdown fragments and excludes transcript reasoning and native actions', async () => {
+  let copied = '';
+  await withController('<main><ol><li id="message" data-message-role="assistant" data-message-complete><h6>Assistant says:</h6><div data-assistant-markdown-root><p>First body fragment</p></div><aside data-message-channel="analysis"><div data-assistant-markdown-root>Private reasoning</div></aside><div data-assistant-markdown><pre><code class="language-python">if ready:\n    run()\n</code></pre><p>Last body fragment</p></div><div data-assistant-message-actions><button>Copy native action</button></div></li></ol></main>', async (page, assertHealthy) => {
+    assertOneButtonGroup(page);
+    buttons(page).find(button => button.textContent === '复制')!.click();
+    await eventually(() => copied.length > 0, assertHealthy, 'copy must export the combined body fragments');
+    assert.match(copied, /First body fragment/);
+    assert.match(copied, /Last body fragment/);
+    assert.match(copied, /if ready:\n    run\(\)/);
+    assert.doesNotMatch(copied, /Assistant says|Private reasoning|Copy native action/);
+  }, document => {
+    Object.defineProperty(document.defaultView!.navigator, 'clipboard', { value: { writeText: async (value: string) => { copied = value; } } });
   });
 });
 

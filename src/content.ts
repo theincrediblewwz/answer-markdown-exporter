@@ -1,6 +1,6 @@
 import { extractMarkdown } from './extract';
 import { renderPreview } from './preview';
-import { answerElements, answerContent, answerKey, generationState, isGenerating, UI_ATTRIBUTE } from './adapter';
+import { answerElements, answerContent, cloneAnswerContent, answerKey, generationState, isGenerating, UI_ATTRIBUTE } from './adapter';
 import type { ExportResult } from './types';
 import { DIAGNOSTICS_MESSAGE, type PageDiagnostics } from './diagnostics';
 import mathCss from 'katex/dist/katex.min.css';
@@ -56,7 +56,7 @@ class ExportControls {
   private snapshots = new Set<ExportSnapshot>();
   constructor() {
     this.observer = new MutationObserver(changes => this.observeChanges(changes));
-    this.observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true, attributeOldValue: true, attributeFilter: ['data-streaming', 'aria-busy', 'data-message-id', 'data-message-author-role', 'data-assistant-markdown-root', 'data-assistant-markdown', 'data-conversation-role', 'data-markdown-text-style', 'data-chatgpt-search-unit-key', 'class', 'src', 'srcset', 'alt', 'title', 'href', 'data-math-source', 'data-math-display', 'encoding', 'rowspan', 'colspan', 'start'] });
+    this.observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true, attributeOldValue: true, attributeFilter: ['data-streaming', 'aria-busy', 'data-talvt-turn-state', 'data-message-complete', 'data-message-role', 'data-message-channel', 'data-message-type', 'data-testid', 'aria-label', 'data-turn-id', 'data-turn-key', 'data-message-id', 'data-message-author-role', 'data-assistant-markdown-root', 'data-assistant-markdown', 'data-conversation-role', 'data-markdown-text-style', 'data-chatgpt-search-unit-key', 'class', 'src', 'srcset', 'alt', 'title', 'href', 'data-math-source', 'data-math-display', 'encoding', 'rowspan', 'colspan', 'start'] });
     window.addEventListener('popstate', this.onRoute);
     chrome.runtime.onMessage?.addListener(this.onMessage);
     this.rescan();
@@ -158,7 +158,7 @@ class ExportControls {
     } catch (error) { if (this.assetCache === cache) this.assetCache = null; throw error; }
   }
   private async capture(answers: Element[], current: () => boolean): Promise<ExportResult[]> {
-    const clones = answers.map(answer => answer.cloneNode(true) as Element);
+    const clones = answers.map(cloneAnswerContent);
     const group = node('div'); group.append(...clones);
     const diagnostics = await prepareIconImages(group, { signal: this.assetAbort.signal, current });
     if (!current()) return [];
@@ -174,13 +174,13 @@ class ExportControls {
   }
   private scan(): void {
     if (this.url !== location.href) { this.generation += 1; this.url = location.href; this.modalHost?.remove(); this.modalHost = null; this.assetAbort.abort(); this.assetAbort = new AbortController(); this.assetCache = null; this.clearSelection(); }
-    const answers = answerElements(); const currentAnswers = new Set(answers);
+    const answers = answerElements(); const state = generationState(answers);
+    const ready = answers.filter(answer => !isGenerating(answer, state) && (answer.textContent?.trim() || answer.querySelector('img, math')));
+    const currentAnswers = new Set(ready);
     for (const [answer, entry] of this.entries) {
       if (!currentAnswers.has(answer) || !entry.host.isConnected || entry.key !== answerKey(answer)) { entry.host.remove(); this.entries.delete(answer); if (this.selected.delete(answer)) this.updateTray(); }
     }
-    const state = generationState(answers);
-    for (const answer of answers) {
-      if (!answer.textContent?.trim() && !answer.querySelector('img, math')) continue;
+    for (const answer of ready) {
       let entry = this.entries.get(answer);
       if (!entry) {
         const host = node('div'); host.setAttribute(UI_ATTRIBUTE, 'controls');
@@ -225,9 +225,8 @@ class ExportControls {
         answer.insertAdjacentElement('afterend', host);
         entry = { host, key: answerKey(answer), status, buttons }; this.entries.set(answer, entry);
       }
-      const busy = isGenerating(answer, state); entry.buttons.forEach(b => { b.disabled = busy || this.pending.has(answer); });
-      if (busy) entry.status.textContent = '回答生成中…';
-      else if (entry.status.textContent === '回答生成中…') entry.status.textContent = '';
+      if (entry.host.previousElementSibling !== answer) answer.insertAdjacentElement('afterend', entry.host);
+      entry.buttons.forEach(b => { b.disabled = this.pending.has(answer); });
     }
   }
   private clearSelection(): void {
