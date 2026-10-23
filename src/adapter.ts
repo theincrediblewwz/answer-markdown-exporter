@@ -55,13 +55,29 @@ export function answerContent(answer: Element): Element {
   // Capture the whole assistant message, not just its first Markdown fragment.
   return answer;
 }
-export function cloneAnswerContent(answer: Element): Element {
+export function answerBodyElements(answer: Element): Element[] {
+  return answer.matches('[data-message-role="assistant"]') && !answer.matches(ANSWER_SELECTOR) ? candidates(answer) : [answer];
+}
+export function cloneAnswerContent(answer: Element, codeSources?: ReadonlyMap<Element, Element>): Element {
+  const copyBody = (body: Element): Element => {
+    const snapshot = codeSources?.get(body);
+    const copied = (snapshot || body).cloneNode(true) as Element;
+    if (!codeSources || snapshot) return copied;
+    const selector = '[data-code-block="true"][data-markdown-copy="code-block"]';
+    const originals = Array.from(body.querySelectorAll(selector));
+    const copies = Array.from(copied.querySelectorAll(selector));
+    for (let index = 0; index < originals.length; index += 1) {
+      const saved = codeSources.get(originals[index]);
+      if (saved) copies[index]?.replaceWith(saved.cloneNode(true));
+    }
+    return copied;
+  };
   let clone: Element;
   if (answer.matches('[data-message-role="assistant"]') && !answer.matches(ANSWER_SELECTOR)) {
     // Keep all sibling body fragments, without cloning message headings or tools.
     clone = answer.ownerDocument.createElement('div');
-    for (const body of candidates(answer)) clone.append(body.cloneNode(true));
-  } else clone = answer.cloneNode(true) as Element;
+    for (const body of answerBodyElements(answer)) clone.append(copyBody(body));
+  } else clone = copyBody(answer);
   for (const label of clone.querySelectorAll('[data-conversation-role="assistant"]')) if (/^H[1-6]$/.test(label.tagName)) label.remove();
   return clone;
 }

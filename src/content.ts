@@ -6,6 +6,7 @@ import { DIAGNOSTICS_MESSAGE, type PageDiagnostics } from './diagnostics';
 import mathCss from 'katex/dist/katex.min.css';
 import { prepareAssets, zipMarkdown, type PreparedAssets } from './assets';
 import { prepareIconImages } from './icons';
+import { captureCodeSources } from './code-sources';
 
 type ReadyExport = ExportResult & { assets?: PreparedAssets };
 type ExportSnapshot = { answers: Element[]; changed: boolean };
@@ -36,7 +37,7 @@ function download(result: ReadyExport): void {
 }
 async function copy(result: ExportResult): Promise<void> { await navigator.clipboard.writeText(result.markdown); }
 function clearPreparingStatus(status: HTMLElement): void {
-  if (['正在加载回答中的图片…', '正在准备内容和图片…', '正在准备所选内容和图片…'].includes(status.textContent || '')) status.textContent = '';
+  if (['正在加载回答中的代码…', '正在加载回答中的图片…', '正在准备内容和图片…', '正在准备所选内容和图片…'].includes(status.textContent || '')) status.textContent = '';
 }
 
 class ExportControls {
@@ -157,8 +158,8 @@ class ExportControls {
       return { ...result, markdown: assets.markdown, assets, diagnostics: [...result.diagnostics, ...assets.diagnostics, ...saved] };
     } catch (error) { if (this.assetCache === cache) this.assetCache = null; throw error; }
   }
-  private async capture(answers: Element[], current: () => boolean): Promise<ExportResult[]> {
-    const clones = answers.map(cloneAnswerContent);
+  private async capture(answers: Element[], current: () => boolean, codeSources?: Map<Element, Element>): Promise<ExportResult[]> {
+    const clones = answers.map(answer => cloneAnswerContent(answer, codeSources));
     const group = node('div'); group.append(...clones);
     const diagnostics = await prepareIconImages(group, { signal: this.assetAbort.signal, current });
     if (!current()) return [];
@@ -197,9 +198,10 @@ class ExportControls {
           this.pending.add(answer); buttons.forEach(button => { button.disabled = true; });
           try {
             await this.revealImages([answerContent(answer)], current, status); if (!current()) return;
+            const codeSources = await captureCodeSources([answerContent(answer)], current, () => { status.textContent = '正在加载回答中的代码…'; }); if (!current()) return;
             snapshot = this.watchSnapshot([answerContent(answer)]);
             status.textContent = '正在准备内容和图片…';
-            const captured = await this.capture([answerContent(answer)], current); if (!current()) return;
+            const captured = await this.capture([answerContent(answer)], current, codeSources); if (!current()) return;
             const result = await this.prepare(captured[0]);
             if (!current()) return;
             if (!result.markdown.trim()) throw new Error('没有找到可导出的回答正文。');
@@ -256,8 +258,9 @@ class ExportControls {
         if (!answers.length) throw new Error('选中的回答已离开页面，请重新选择。');
         if (answers.some(answer => isGenerating(answer))) throw new Error('选中的回答仍在生成，请完成后导出。');
         await this.revealImages(answers.map(answerContent), current, status); if (!current()) return;
+        const codeSources = await captureCodeSources(answers.map(answerContent), current, () => { status.textContent = '正在加载回答中的代码…'; }); if (!current()) return;
         snapshot = this.watchSnapshot(answers.map(answerContent));
-        const results = await this.capture(answers.map(answerContent), current); if (!current()) return;
+        const results = await this.capture(answers.map(answerContent), current, codeSources); if (!current()) return;
         const combined: ExportResult = {
           markdown: results.map(item => item.markdown).join('\n---\n\n'),
           diagnostics: [{code:'LOADED_SELECTION',severity:'info',message:`本次仅含按页面顺序选中的 ${answers.length} 条已加载回答。`}, ...results.flatMap(item => item.diagnostics)],

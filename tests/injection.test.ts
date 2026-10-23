@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { JSDOM, VirtualConsole } from 'jsdom';
 import { strFromU8, unzipSync } from 'fflate';
+import { unified } from 'unified';
+import remarkParse from 'remark-parse';
 import type { PageDiagnostics } from '../src/diagnostics';
 
 const bundledContent = build({
@@ -740,5 +742,70 @@ test('a copy failure keeps its recovery message when the fallback preview render
   }, document => {
     mockDialogs(document);
     Object.defineProperty(document.defaultView!.navigator, 'clipboard', { value: { writeText: async () => { throw new Error('Synthetic clipboard denial'); } } });
+  });
+});
+
+test('copy captures both virtualized modern code sources before scrolling unmounts them and restores the original position', async () => {
+  const samples = [
+    { language: 'python', label: 'Python', source: 'def first():\n    marker = "```"\n\n    return 1' },
+    { language: 'javascript', label: 'JavaScript', source: 'function second() {\n    const value = 2;\n\n    return value;\n}' },
+  ];
+  const markup = samples.map((sample, index) => `<div id="virtual-code-${index}" data-code-block="true" data-markdown-copy="code-block"><div data-markdown-copy="exclude"><div>${sample.label}</div><div data-code-block-controls="true"><button>复制代码</button></div></div><div data-code-placeholder style="height:180px"></div></div>`).join('');
+  const reveals: number[] = [];
+  let copies = 0;
+  let copied = '';
+  let restores = 0;
+  await withController(`<main id="code-scroller"><div data-message-author-role="assistant"><p>Two virtualized code examples.</p>${markup}</div></main>`, async (page, assertHealthy, requestDiagnostics) => {
+    assertOneButtonGroup(page);
+    assert.equal(page.window.document.querySelectorAll('[data-code-block-source]').length, 0, 'neither source starts mounted');
+    const status = controls(page)[0].shadowRoot!.querySelector('[role="status"]')!;
+    buttons(page).find(button => button.textContent === '复制')!.click();
+    await eventually(() => copies === 1 && buttons(page).every(button => !button.disabled) && status.textContent === 'Markdown 已复制', assertHealthy, 'copy must finish after capturing both sources');
+    assert.deepEqual(reveals, [0, 1], 'each missing block must become visible in reading order');
+    const exported = unified().use(remarkParse).parse(copied).children.filter(node => node.type === 'code');
+    assert.deepEqual(exported.map(node => ({ language: node.lang, source: node.value })), samples.map(({ language, source }) => ({ language, source })), 'both languages, exact nesting, blank lines and embedded backticks must survive');
+    assert.match(copied, /Two virtualized code examples/);
+    assert.doesNotMatch(copied, /复制代码|源码尚未加载|代码尚未加载|height:180px/);
+    const scroller = page.window.document.querySelector('#code-scroller')!;
+    assert.equal(scroller.scrollTop, 73);
+    assert.equal(scroller.scrollLeft, 19);
+    assert.equal(restores, 1);
+    assert.equal(page.window.document.querySelectorAll('[data-code-block-source]').length, 0, 'restoring the old viewport may unmount every source without changing the captured copy');
+    assertOneButtonGroup(page);
+    assert.equal(requestDiagnostics().controlCount, 1);
+    assert.equal(status.textContent, 'Markdown 已复制');
+    assertHealthy();
+  }, document => {
+    const scroller = document.querySelector('#code-scroller')!;
+    scroller.scrollTop = 73; scroller.scrollLeft = 19;
+    const unmount = () => {
+      for (const source of document.querySelectorAll('[data-code-block-source]')) {
+        const placeholder = document.createElement('div');
+        placeholder.setAttribute('data-code-placeholder', '');
+        placeholder.style.height = '180px';
+        source.replaceWith(placeholder);
+      }
+    };
+    samples.forEach((sample, index) => {
+      const block = document.querySelector(`#virtual-code-${index}`)!;
+      Object.defineProperty(block, 'scrollIntoView', { value: () => {
+        reveals.push(index);
+        unmount();
+        const source = document.createElement('div');
+        source.setAttribute('data-code-block-source', 'true');
+        const code = document.createElement('code');
+        const span = document.createElement('span');
+        span.textContent = sample.source;
+        code.append(span); source.append(code);
+        block.querySelector('[data-code-placeholder]')!.replaceWith(source);
+        scroller.scrollTop = 300 + index * 200; scroller.scrollLeft = 81;
+      } });
+    });
+    Object.defineProperty(scroller, 'scrollTo', { value: ({ top, left }: { top: number; left: number }) => {
+      restores += 1;
+      scroller.scrollTop = top; scroller.scrollLeft = left;
+      unmount();
+    } });
+    Object.defineProperty(document.defaultView!.navigator, 'clipboard', { value: { writeText: async (value: string) => { copies += 1; copied = value; } } });
   });
 });

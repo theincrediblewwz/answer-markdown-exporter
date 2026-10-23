@@ -17,7 +17,8 @@ interface Cell { header: boolean; colspan: number; rowspan: number; blocks: Ast[
 interface AttachmentRow { name: string; kind: string; url: string | null; }
 
 const inlineTypes = new Set(['text', 'strong', 'emphasis', 'delete', 'inlineCode', 'inlineMath', 'link', 'image', 'break']);
-const ignoreSelector = 'script,style,noscript,template,button,input,textarea,select,[hidden],[data-gpt-md-ui],[data-gpt-md-ignore],[data-message-content-controls],[data-markdown-copy="exclude"],h4[data-conversation-role="assistant"][tabindex="-1"]:not([data-d-component]),[role="toolbar"],[aria-hidden="true"]';
+const messageImageButton = 'button[data-message-image="original"][aria-haspopup="dialog"]';
+const ignoreSelector = 'script,style,noscript,template,button:not([data-message-image="original"][aria-haspopup="dialog"]),input,textarea,select,[hidden],[data-gpt-md-ui],[data-gpt-md-ignore],[data-message-content-controls],[data-markdown-copy="exclude"],h4[data-conversation-role="assistant"][tabindex="-1"]:not([data-d-component]),[role="toolbar"],[aria-hidden="true"]';
 const blockTags = new Set(['DIV', 'SECTION', 'ARTICLE', 'MAIN', 'FIGURE', 'FIGCAPTION', 'DETAILS', 'SUMMARY', 'HEADER', 'FOOTER', 'ADDRESS', 'ASIDE']);
 const serializer = unified().use(remarkGfm).use(remarkMath).use(remarkStringify, {
   bullet: '-', fences: true, listItemIndent: 'one', emphasis: '*', strong: '*',
@@ -104,10 +105,23 @@ class Capture {
     if (node.nodeType !== 1) return [];
     const element = node as Element;
     if (element.matches(ignoreSelector)) return [];
+    // GPT wraps answer images in a zoom button. Keep only its image children;
+    // the button's label and interaction chrome are never answer content.
+    if (element.matches(messageImageButton)) {
+      const images = Array.from(element.querySelectorAll('img')).filter(image => image.closest('button') === element && !image.closest(ignoreSelector));
+      if (images.length) return images.flatMap(image => this.visit(image));
+      this.note('IMAGE_NOT_LOADED', '有回答图片尚未提供可保存资源，已保留图片位置；请在原页加载图片后重试。');
+      return [text(`[图片尚未加载：${element.getAttribute('aria-label') || '回答图片'}]`)];
+    }
     const renderedCode = this.renderedCodeBlock(element);
     if (renderedCode) return [renderedCode];
     const codeMirror = this.codeMirror(element);
     if (codeMirror) return [codeMirror];
+    if (element.matches('[data-code-block="true"][data-markdown-copy="code-block"]')
+      && !element.querySelector('[data-code-block-source="true"] code,pre code')) {
+      this.note('CODE_SOURCE_NOT_LOADED', '有代码块尚未加载，未取得源码；已保留代码位置，请在原页加载后重试。');
+      return [...asBlocks(this.children(element)), { type: 'paragraph', children: [text('[代码块尚未加载，未取得源码]')] }];
+    }
     const formula = this.formula(element);
     if (formula) return [formula];
     const attachments = this.attachments(element);
@@ -370,6 +384,25 @@ class Capture {
   }
 
   renderedCodeBlock(element: Element): Ast | null {
+    // Current GPT code surfaces use a marked source DIV rather than PRE.
+    // Consume only a self-contained surface with its own controls and label.
+    if (element.matches('[data-code-block="true"][data-markdown-copy="code-block"]')) {
+      const parts = Array.from(element.children);
+      const source = parts.find(child => child.matches('[data-code-block-source="true"]'));
+      const header = parts.find(child => child.matches('[data-markdown-copy="exclude"]'));
+      const labels = Array.from(header?.children || []).filter(child => child.tagName.toUpperCase() === 'DIV'
+        && !child.childElementCount && !child.hasAttribute('data-code-block-controls') && !child.matches(ignoreSelector));
+      const label = labels.length === 1 ? labels[0].textContent?.trim() : null;
+      const looseText = Array.from(element.childNodes).some(child => child.nodeType === 3 && /\S/.test(child.nodeValue || ''));
+      const sourceOnly = source?.childElementCount === 1 && !source.matches(ignoreSelector)
+        && source.firstElementChild?.tagName.toUpperCase() === 'CODE' && !source.firstElementChild.matches(ignoreSelector)
+        && !Array.from(source.childNodes).some(child => child.nodeType === 3 && /\S/.test(child.nodeValue || ''));
+      if (sourceOnly && header?.querySelector('[data-code-block-controls="true"]')
+        && label && /^[\w.+#-]+$/.test(label) && !looseText
+        && parts.every(child => child === source || child === header || child.matches(ignoreSelector))) {
+        return this.code(source, this.language([element]) || label.toLowerCase());
+      }
+    }
     // The current GPT renderer puts the language beside PRE instead of on CODE.
     // Require its code-control marker and an otherwise self-contained block so
     // an ordinary paragraph that happens to precede code stays ordinary prose.
