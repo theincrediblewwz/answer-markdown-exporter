@@ -569,11 +569,80 @@ test('a selected answer becoming busy cancels a PDF export still preparing image
   });
 });
 
-test('a downloaded ZIP includes extraction explanations alongside image failures', async () => {
-  let archive: Blob | undefined;
-  await withController('<main><div data-message-author-role="assistant"><p>Download answer</p><span data-d-component="pressable" role="link"><span>Open attachment</span></span><img src="https://images.example.test/zip.png" alt="sample"></div></main>', async (page, assertHealthy) => {
+test('a plain answer downloads a Markdown file with unchanged content and no image requests', async () => {
+  let payload: Blob | undefined;
+  let filename = '';
+  let fetches = 0;
+  await withController('<main><div data-message-author-role="assistant"><p>Plain answer.</p><p>Second paragraph.</p></div></main>', async (page, assertHealthy) => {
     buttons(page).find(button => button.textContent === '下载 Markdown')!.click();
-    await eventually(() => !!archive, assertHealthy, 'download must produce a ZIP Blob');
+    await eventually(() => !!payload && filename !== '' && buttons(page).every(button => !button.disabled), assertHealthy, 'plain content must produce a completed download');
+    assert.match(filename, /^Answer-.*\.md$/);
+    assert.equal(payload!.type, 'text/markdown;charset=utf-8');
+    const markdown = await new Promise<string>((resolve, reject) => {
+      const reader = new page.window.FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(payload!);
+    });
+    assert.equal(markdown, 'Plain answer.\n\nSecond paragraph.\n');
+    assert.equal(fetches, 0);
+    assert.equal(controls(page)[0].shadowRoot!.querySelector('[role="status"]')!.textContent, 'Markdown 已生成');
+    assertOneButtonGroup(page);
+  }, document => {
+    const view = document.defaultView!;
+    Object.defineProperty(view, 'fetch', { value: async () => { fetches += 1; throw new Error('No image request is expected'); } });
+    Object.defineProperty(view.URL, 'createObjectURL', { value: (blob: Blob) => { payload = blob; return 'blob:plain-download'; } });
+    Object.defineProperty(view.URL, 'revokeObjectURL', { value: () => {} });
+    Object.defineProperty(view.HTMLAnchorElement.prototype, 'click', { value: function(this: HTMLAnchorElement) { filename = this.download; } });
+  });
+});
+
+test('an answer with only an unavailable image downloads Markdown with its original link and keeps warnings visible in preview', async () => {
+  let payload: Blob | undefined;
+  let filename = '';
+  const imageUrl = 'https://images.example.test/unavailable-only.png';
+  await withController(`<main><div data-message-author-role="assistant"><p>Before</p><img src="${imageUrl}" alt="missing"><p>After</p></div></main>`, async (page, assertHealthy) => {
+    buttons(page).find(button => button.textContent === '下载 Markdown')!.click();
+    await eventually(() => !!payload && filename !== '' && buttons(page).every(button => !button.disabled), assertHealthy, 'a failed-only image export must still finish its download');
+    assert.match(filename, /^Answer-.*\.md$/);
+    assert.equal(payload!.type, 'text/markdown;charset=utf-8');
+    const markdown = await new Promise<string>((resolve, reject) => {
+      const reader = new page.window.FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(payload!);
+    });
+    assert.equal(markdown, `Before\n\n![missing](${imageUrl})\n\nAfter\n`, 'a failure must neither rewrite its URL nor append ZIP-only notes to the answer');
+    const status = controls(page)[0].shadowRoot!.querySelector('[role="status"]')!;
+    assert.match(status.textContent || '', /^Markdown 已生成；/);
+    assert.doesNotMatch(status.textContent || '', /图片包 ZIP/);
+    buttons(page).find(button => button.textContent === '预览')!.click();
+    await eventually(() => status.textContent?.startsWith('Markdown 预览已生成') === true && buttons(page).every(button => !button.disabled), assertHealthy, 'the failure explanation must remain available from preview');
+    const preview = page.window.document.querySelector('[data-gpt-md-ui="preview"]')!;
+    const notes = preview.shadowRoot!.querySelector<HTMLElement>('.notes')!;
+    assert.equal(notes.hidden, false);
+    assert.match(notes.textContent || '', /图片引用无法读取/);
+    assert.doesNotMatch(notes.textContent || '', /ZIP 内的 EXPORT-NOTES\.md/);
+    assertOneButtonGroup(page);
+  }, document => {
+    const view = document.defaultView!;
+    mockDialogs(document);
+    Object.defineProperty(view, 'fetch', { value: async () => { throw new Error('Synthetic unavailable image'); } });
+    Object.defineProperty(view.URL, 'createObjectURL', { value: (blob: Blob) => { payload = blob; return 'blob:failed-image-download'; } });
+    Object.defineProperty(view.URL, 'revokeObjectURL', { value: () => {} });
+    Object.defineProperty(view.HTMLAnchorElement.prototype, 'click', { value: function(this: HTMLAnchorElement) { filename = this.download; } });
+  });
+});
+
+test('a downloaded ZIP includes a saved image and extraction explanations alongside another image failure', async () => {
+  let archive: Blob | undefined;
+  let filename = '';
+  const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+  await withController(`<main><div data-message-author-role="assistant"><p>Download answer</p><span data-d-component="pressable" role="link"><span>Open attachment</span></span><img src="data:image/png;base64,${pngBase64}" alt="saved"><img src="https://images.example.test/zip.png" alt="unavailable"></div></main>`, async (page, assertHealthy) => {
+    buttons(page).find(button => button.textContent === '下载 Markdown')!.click();
+    await eventually(() => !!archive && filename !== '' && buttons(page).every(button => !button.disabled), assertHealthy, 'a partially successful image download must produce a ZIP Blob');
+    assert.match(filename, /^Answer-.*\.zip$/);
+    assert.equal(archive!.type, 'application/zip');
     const bytes = await new Promise<Uint8Array>((resolve, reject) => {
       const reader = new page.window.FileReader();
       reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
@@ -581,16 +650,23 @@ test('a downloaded ZIP includes extraction explanations alongside image failures
       reader.readAsArrayBuffer(archive!);
     });
     const files = unzipSync(bytes);
+    assert.deepEqual(Object.keys(files).sort(), ['EXPORT-NOTES.md', 'answer.md', 'images/image-001.png']);
+    assert.deepEqual([...files['images/image-001.png']], [...Buffer.from(pngBase64, 'base64')], 'the ZIP must contain the exact successful raster bytes');
+    const markdown = strFromU8(files['answer.md']);
+    assert.match(markdown, /!\[saved\]\(images\/image-001\.png\)/);
+    assert.match(markdown, /!\[unavailable\]\(https:\/\/images\.example\.test\/zip\.png\)/);
     const notes = strFromU8(files['EXPORT-NOTES.md']);
     assert.match(notes, /^# 导出说明/);
     assert.match(notes, /交互入口没有可确认的可移植链接/);
     assert.match(notes, /图片引用无法读取/);
+    assert.match(controls(page)[0].shadowRoot!.querySelector('[role="status"]')!.textContent || '', /^Markdown 图片包 ZIP 已生成/);
+    assertOneButtonGroup(page);
   }, document => {
     const view = document.defaultView!;
     Object.defineProperty(view, 'fetch', { value: async () => { throw new Error('Synthetic image failure'); } });
     Object.defineProperty(view.URL, 'createObjectURL', { value: (blob: Blob) => { archive = blob; return 'blob:local-download'; } });
     Object.defineProperty(view.URL, 'revokeObjectURL', { value: () => {} });
-    Object.defineProperty(view.HTMLAnchorElement.prototype, 'click', { value: () => {} });
+    Object.defineProperty(view.HTMLAnchorElement.prototype, 'click', { value: function(this: HTMLAnchorElement) { filename = this.download; } });
   });
 });
 

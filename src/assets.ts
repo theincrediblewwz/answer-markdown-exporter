@@ -11,6 +11,7 @@ export interface PreparedAssets {
   markdown: string;
   imageAssets: Record<string, string>;
   files: Record<string, Uint8Array>;
+  /** Whether at least one image was successfully saved into files. */
   hasImages: boolean;
   diagnostics: Diagnostic[];
 }
@@ -162,13 +163,13 @@ function diagnostic(code: string, index: number): Diagnostic {
     IMAGE_COUNT_LIMIT: '超过本次 30 张不同图片的保存上限', IMAGE_TIMEOUT: '读取超时',
     IMAGE_ABORTED: '保存已取消', IMAGE_ASSET_UNAVAILABLE: '无法读取，可能需要原对话登录状态或站点不允许跨域读取',
   };
-  return { code, severity: 'warning', message: `第 ${index} 个图片引用${reason[code] || reason.IMAGE_ASSET_UNAVAILABLE}；Markdown 保留原链接，ZIP 内的 EXPORT-NOTES.md 记录未保存说明。` };
+  return { code, severity: 'warning', message: `第 ${index} 个图片引用${reason[code] || reason.IMAGE_ASSET_UNAVAILABLE}；Markdown 保留原链接，未保存说明可在预览中查看。` };
 }
 
 /** Resolve only images already referenced in an export, without changing other Markdown. */
 export async function prepareAssets(markdown: string, options: { fetcher?: typeof fetch; signal?: AbortSignal } = {}): Promise<PreparedAssets> {
   const references = imageReferences(markdown);
-  const prepared: PreparedAssets = { markdown, imageAssets: {}, files: {}, hasImages: references.length > 0, diagnostics: [] };
+  const prepared: PreparedAssets = { markdown, imageAssets: {}, files: {}, hasImages: false, diagnostics: [] };
   if (!references.length) return prepared;
   const urls = [...new Set(references.map(reference => reference.url))];
   const replacements = new Map<string, string>();
@@ -192,6 +193,7 @@ export async function prepareAssets(markdown: string, options: { fetcher?: typeo
     const path = replacements.get(reference.url);
     if (path) prepared.markdown = prepared.markdown.slice(0, reference.start) + reference.render(path) + prepared.markdown.slice(reference.end);
   }
+  prepared.hasImages = saved > 0;
   return prepared;
 }
 

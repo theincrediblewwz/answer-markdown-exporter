@@ -71,7 +71,7 @@ test('controlled HTML table images preserve every other byte and decode URL attr
 test('HTML data-src is not mistaken for src and an image missing src is explicitly unsaved', async () => {
   const markdown = '<table><tr><td><img data-src="https://images.example/private.png" alt="placeholder"></td></tr></table>\n';
   const prepared = await prepareAssets(markdown, { fetcher: noFetch });
-  assert.equal(prepared.hasImages, true);
+  assert.equal(prepared.hasImages, false);
   assert.equal(prepared.markdown, markdown);
   assert.equal(prepared.diagnostics[0].code, 'IMAGE_ASSET_UNAVAILABLE');
 });
@@ -111,13 +111,31 @@ test('unavailable images keep their original references and report failures with
   const url = 'https://images.example/photo.png?signature=private-secret';
   const markdown = `![photo](${url})\n`;
   const prepared = await prepareAssets(markdown, { fetcher: (async () => { throw new Error('Failed CORS ' + url); }) as typeof fetch });
-  assert.equal(prepared.hasImages, true);
+  assert.equal(prepared.hasImages, false);
   assert.equal(prepared.markdown, markdown);
   assert.equal(prepared.diagnostics[0].code, 'IMAGE_ASSET_UNAVAILABLE');
   assert.doesNotMatch(JSON.stringify(prepared.diagnostics), /signature|private-secret|images\.example/);
+  assert.doesNotMatch(prepared.diagnostics[0].message, /ZIP|EXPORT-NOTES/);
   const files = unzipSync(zipMarkdown(prepared));
   assert.equal(strFromU8(files['answer.md']), markdown);
   assert.match(strFromU8(files['EXPORT-NOTES.md']), /Markdown 保留原链接/);
+});
+
+test('only successfully saved images require bundling when some image references fail', async () => {
+  const markdown = '# Answer\n\n![saved](https://images.example/saved.png)\n\n![unavailable](https://images.example/unavailable.png)\n';
+  const prepared = await prepareAssets(markdown, { fetcher: (async input => {
+    if (String(input).endsWith('/saved.png')) return response();
+    throw new Error('Unavailable');
+  }) as typeof fetch });
+  assert.equal(prepared.hasImages, true);
+  assert.deepEqual(Object.keys(prepared.files), ['images/image-001.png']);
+  assert.match(prepared.markdown, /!\[saved\]\(images\/image-001\.png\)/);
+  assert.match(prepared.markdown, /!\[unavailable\]\(https:\/\/images\.example\/unavailable\.png\)/);
+  assert.equal(prepared.diagnostics.length, 1);
+  const files = unzipSync(zipMarkdown(prepared));
+  assert.deepEqual(Object.keys(files).sort(), ['EXPORT-NOTES.md', 'answer.md', 'images/image-001.png']);
+  assert.deepEqual(files['images/image-001.png'], png);
+  assert.equal(strFromU8(files['answer.md']), prepared.markdown);
 });
 
 test('the advertised per-image size is rejected before reading the response body', async () => {
