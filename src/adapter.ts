@@ -62,7 +62,7 @@ export function cloneAnswerContent(answer: Element, codeSources?: ReadonlyMap<El
   const copyBody = (body: Element): Element => {
     const snapshot = codeSources?.get(body);
     const copied = (snapshot || body).cloneNode(true) as Element;
-    if (!codeSources || snapshot) return copied;
+    if (!codeSources || snapshot) { annotateLayout(body, copied); return copied; }
     const selector = '[data-code-block="true"][data-markdown-copy="code-block"]';
     const originals = Array.from(body.querySelectorAll(selector));
     const copies = Array.from(copied.querySelectorAll(selector));
@@ -70,6 +70,7 @@ export function cloneAnswerContent(answer: Element, codeSources?: ReadonlyMap<El
       const saved = codeSources.get(originals[index]);
       if (saved) copies[index]?.replaceWith(saved.cloneNode(true));
     }
+    annotateLayout(body, copied);
     return copied;
   };
   let clone: Element;
@@ -102,3 +103,4 @@ export function isGenerating(answer: Element, state = generationState()): boolea
   if (turn.matches(BUSY_SELECTOR) || turn.querySelector(BUSY_SELECTOR)) return true;
   return state.stop && (state.activeTurn ? turn === state.activeTurn : state.last === answer);
 }
+import { annotateLayout } from './layout';

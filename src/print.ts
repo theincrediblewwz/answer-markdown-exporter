@@ -3,6 +3,7 @@ import type { Diagnostic, PreviewResult } from './types';
 import type { PrintPayload } from './background';
 import printCss from './print.css';
 import mathCss from 'katex/dist/katex.min.css';
+import documentCss from './document.css';
 
 const tokenPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const rasterPattern = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
@@ -16,6 +17,7 @@ function styles(): void {
     const name = value.replace(/["']/g, '').replace(/^fonts\//, '');
     return `url("${chrome.runtime.getURL('vendor/katex/fonts/' + name)}")`;
   });
+  style.textContent += '\n' + documentCss;
   document.head.append(style);
 }
 function waitAtMost(promise: Promise<unknown>, milliseconds: number): Promise<boolean> {

@@ -5,6 +5,9 @@ import remarkMath from 'remark-math';
 import { renderToString } from 'katex';
 import type { Root } from 'mdast';
 import type { CodeRecord, Diagnostic, ExportResult, FormulaRecord } from './types';
+import { serializeNativeMathML } from './native-mathml';
+import { highlightedCard, layoutColumns, layoutStyle } from './layout';
+import { ignoredContentSelector, excludedContent } from './content-policy';
 
 /** An internal, small mdast builder. No page-owned nodes are changed. */
 interface Ast {
@@ -13,12 +16,12 @@ interface Ast {
   value?: string;
   [key: string]: unknown;
 }
-interface Cell { header: boolean; colspan: number; rowspan: number; blocks: Ast[]; align: string | null; }
+interface Cell { header: boolean; colspan: number; rowspan: number; blocks: Ast[]; align: string | null; scope: string | null; attributes: string; }
 interface AttachmentRow { name: string; kind: string; url: string | null; }
 
 const inlineTypes = new Set(['text', 'strong', 'emphasis', 'delete', 'inlineCode', 'inlineMath', 'link', 'image', 'break']);
 const messageImageButton = 'button[data-message-image="original"][aria-haspopup="dialog"]';
-const ignoreSelector = 'script,style,noscript,template,button:not([data-message-image="original"][aria-haspopup="dialog"]),input,textarea,select,[hidden],[data-gpt-md-ui],[data-gpt-md-ignore],[data-message-content-controls],[data-markdown-copy="exclude"],h4[data-conversation-role="assistant"][tabindex="-1"]:not([data-d-component]),[role="toolbar"],[aria-hidden="true"]';
+const ignoreSelector = ignoredContentSelector;
 const blockTags = new Set(['DIV', 'SECTION', 'ARTICLE', 'MAIN', 'FIGURE', 'FIGCAPTION', 'DETAILS', 'SUMMARY', 'HEADER', 'FOOTER', 'ADDRESS', 'ASIDE']);
 const serializer = unified().use(remarkGfm).use(remarkMath).use(remarkStringify, {
   bullet: '-', fences: true, listItemIndent: 'one', emphasis: '*', strong: '*',
@@ -85,7 +88,49 @@ function safeUrl(value: string, element: Element): string | null {
   } catch { return /^(?:[./#?]|[^:]+$)/.test(clean) ? clean : null; }
 }
 
+function localFragment(value: string, element: Element): string | null {
+  let fragment: string;
+  if (value.startsWith('#')) fragment = value.slice(1);
+  else {
+    try {
+      const base = new URL(element.ownerDocument.baseURI), target = new URL(value, base);
+      if (!target.hash || target.origin !== base.origin || target.pathname !== base.pathname || target.search !== base.search) return null;
+      fragment = target.hash.slice(1);
+    } catch { return null; }
+  }
+  try { return decodeURIComponent(fragment); } catch { return fragment; }
+}
+
+function originalMathMarkup(root: Element): string {
+  // Unsupported math is saved literally, with a preflight budget before asking
+  // the browser for a potentially large outerHTML string. Never truncate a
+  // formula and then report a successful, complete export.
+  const stack: Node[] = [root]; let characters = 0; let nodes = 0;
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (++nodes > 200_000) throw new Error('数学源码节点过多，无法完整导出，请分段保存。');
+    if (node.nodeType === 1) {
+      const element = node as Element;
+      characters += element.tagName.length * 2 + 5;
+      for (const attr of element.attributes) characters += attr.name.length + attr.value.length * 6 + 4;
+    } else characters += (node.nodeValue?.length || 0) * 6;
+    if (characters > 2_000_000) throw new Error('数学原始标记超过安全限额，未生成截断文件，请分段保存。');
+    for (const child of node.childNodes) stack.push(child);
+  }
+  return root.outerHTML;
+}
+
 class Capture {
+  private ids = new Map<string, string>();
+  constructor(root: Element, idPrefix: string) {
+    const prefix = idPrefix.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 64) || 'answer';
+    const referenced = new Set([root, ...root.querySelectorAll('a[href]')].map(link => localFragment(link.getAttribute('href') || '', link)).filter(value => value !== null));
+    const targets = [root, ...root.querySelectorAll('[id]')];
+    for (const target of targets) {
+      const id = target.getAttribute('id');
+      if (id && referenced.has(id) && !target.closest(ignoreSelector) && !this.ids.has(id)) this.ids.set(id, `gpt-md-${prefix}-${this.ids.size + 1}`);
+    }
+  }
   private mathHtmlCharacters = 0;
   private mathHtmlCache = new Map<string, string>();
   diagnostics: Diagnostic[] = [];
@@ -99,12 +144,45 @@ class Capture {
 
   children(element: Element): Ast[] { return Array.from(element.childNodes).flatMap(node => this.visit(node)); }
 
+  anchor(element: Element): Ast[] {
+    const id = this.ids.get(element.getAttribute('id') || '');
+    return id ? [{ type: 'html', value: `<a id="${id}"></a>` }] : [];
+  }
+
+  attributes(element: Element): string {
+    const id = this.ids.get(element.getAttribute('id') || '');
+    const dir = element.getAttribute('dir');
+    return (id ? ` id="${id}"` : '') + (dir && /^(?:ltr|rtl|auto)$/.test(dir) ? ` dir="${dir}"` : '');
+  }
+
   visit(node: Node): Ast[] {
+    let result = this.captureNode(node);
+    if (node.nodeType !== 1 || !result.length) return result;
+    const element = node as Element;
+    const dir = element.getAttribute('dir');
+    if (dir && /^(?:ltr|rtl|auto)$/.test(dir) && !element.matches('math,.katex,.katex-display,[data-math-source],[data-d-component="math"],bdi,bdo,pre,code')) {
+      if (element.tagName.toUpperCase() === 'P') {
+        result = asBlocks(result).map(part => ({ type: 'html', block: true, value: part.type === 'paragraph'
+          ? `<p dir="${dir}">${(part.children || []).map(child => this.html(child)).join('')}</p>`
+          : `<div dir="${dir}">${this.html(part)}</div>` }));
+      } else if (result.every(isInline)) result = [{ type: 'html', value: `<span dir="${dir}">${result.map(part => this.html(part)).join('')}</span>` }];
+      else result = [{ type: 'html', block: true, value: `<div dir="${dir}">${asBlocks(result).map(part => this.html(part)).join('')}</div>` }];
+    }
+    return [...this.anchor(element), ...result];
+  }
+
+  captureNode(node: Node): Ast[] {
     if (++this.visited > 200_000) throw new Error('回答内容过大，请分段导出。');
-    if (node.nodeType === 3) return [text((node.nodeValue || '').replace(/[ \t\r\n]+/g, ' '))];
+    if (node.nodeType === 3) {
+      const value = node.nodeValue || '';
+      const preLine = node.parentElement && /^(?:pre-line|pre-wrap|break-spaces|pre)$/.test(layoutStyle(node.parentElement, 'white-space'));
+      return preLine ? value.replace(/\r\n?/g, '\n').split('\n').flatMap((line, index) => [...(index ? [{ type: 'break' }] : []), text(line)]) : [text(value.replace(/[ \t\r\n]+/g, ' '))];
+    }
     if (node.nodeType !== 1) return [];
     const element = node as Element;
     if (element.matches(ignoreSelector)) return [];
+    if (element.hasAttribute('data-gpt-md-layout-incomplete')) this.note('LAYOUT_CAPTURE_LIMIT', '部分布局信息超过采集数量限额，已保留可取得的正文结构；请核对较长回答。');
+    if (layoutStyle(element, 'display') === 'none') return [];
     // GPT wraps answer images in a zoom button. Keep only its image children;
     // the button's label and interaction chrome are never answer content.
     if (element.matches(messageImageButton)) {
@@ -126,6 +204,8 @@ class Capture {
     if (formula) return [formula];
     const attachments = this.attachments(element);
     if (attachments) return attachments;
+    const layout = this.layout(element);
+    if (layout) return layout;
     const component = this.component(element);
     if (component) return component;
     const tag = element.tagName.toUpperCase();
@@ -145,33 +225,54 @@ class Capture {
       const url = safeUrl(element.getAttribute('src') || element.getAttribute('data-src') || '', element);
       const alt = element.getAttribute('alt') || '';
       if (!url) { this.note('IMAGE_SOURCE_MISSING', '有图片缺少可保存的链接，已保留替代文字。'); return [text(alt || '[图片链接不可用]')]; }
+      if (element.hasAttribute('data-gpt-md-diagram-image')) {
+        const width = Math.min(1200, Math.max(1, Number(element.getAttribute('width')) || 600));
+        const height = Math.min(1200, Math.max(1, Number(element.getAttribute('height')) || 400));
+        return [{ type: 'html', value: `<img src="${escapeHtml(url)}" alt="${escapeHtml(alt)}" width="${width}" height="${height}" style="max-width:100%;height:auto">`, block: true }];
+      }
       return [{ type: 'image', url, alt, title: element.getAttribute('title') || null }];
     }
     if (tag === 'TABLE') return this.table(element);
     if (tag === 'UL' || tag === 'OL') {
-      const items = Array.from(element.children).filter(child => child.tagName.toUpperCase() === 'LI');
-      return [{
+      const items = Array.from(element.children).filter(child => child.tagName.toUpperCase() === 'LI' && !excludedContent(child) && layoutStyle(child, 'display') !== 'none');
+      const children = items.map(item => {
+        const checkbox = Array.from(item.querySelectorAll('input[type="checkbox"]')).find(input => input.closest('li') === item) as HTMLInputElement | undefined;
+        const blocks = asBlocks(this.children(item));
+        const dir = /^(?:ltr|rtl|auto)$/.test(item.getAttribute('dir') || '') ? item.getAttribute('dir') : null;
+        return { type: 'listItem', checked: checkbox ? checkbox.checked : null, dir, spread: blocks.length > 1, children: [...this.anchor(item), ...blocks] };
+      });
+      const list = {
         type: 'list', ordered: tag === 'OL', start: tag === 'OL' ? Number(element.getAttribute('start') || 1) : null,
-        spread: items.some(item => item.querySelector('p + p')),
-        children: items.map(item => {
-          const checkbox = Array.from(item.querySelectorAll('input[type="checkbox"]'))
-            .find(input => input.closest('li') === item) as HTMLInputElement | undefined;
-          return { type: 'listItem', checked: checkbox ? checkbox.checked : null, spread: false, children: asBlocks(this.children(item)) };
-        }),
-      }];
+        spread: children.some(item => item.spread), children,
+      };
+      return children.some(item => item.dir) ? [{ type: 'html', block: true, value: this.html(list) }] : [list];
     }
     if (tag === 'BLOCKQUOTE') return [{ type: 'blockquote', children: asBlocks(this.children(element)) }];
     if (/^H[1-6]$/.test(tag)) {
       const converted = asBlocks(this.children(element));
       return converted.map(part => part.type === 'paragraph' ? { type: 'heading', depth: Number(tag[1]), children: part.children } : part);
     }
-    if (tag === 'P') return asBlocks(this.children(element));
+    if (tag === 'P') {
+      const blocks = asBlocks(this.children(element));
+      if (Array.from(element.children).some(child => child.tagName.toUpperCase() === 'SPAN' && layoutStyle(child, 'display') === 'block')
+        && blocks.every(part => part.type === 'paragraph')) {
+        return [{ type: 'paragraph', children: blocks.flatMap((part, index) => [...(index ? [{ type: 'break' }] : []), ...(part.children || [])]) }];
+      }
+      return blocks;
+    }
+    if (tag === 'DL') return [{ type: 'html', block: true, value: `<dl>${this.definitionChildren(element)}</dl>` }];
+    if (['RUBY', 'RT', 'RP', 'BDI', 'BDO', 'MARK'].includes(tag)) {
+      const direction = /^(?:ltr|rtl|auto)$/.test(element.getAttribute('dir') || '') ? ` dir="${element.getAttribute('dir')}"` : '';
+      return [{ type: 'html', value: `<${tag.toLowerCase()}${direction}>${this.children(element).map(part => this.html(part)).join('')}</${tag.toLowerCase()}>` }];
+    }
     const children = this.children(element);
     if (tag === 'STRONG' || tag === 'B') return this.inlineWrapper('strong', children);
     if (tag === 'EM' || tag === 'I') return this.inlineWrapper('emphasis', children);
     if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') return this.inlineWrapper('delete', children);
     if (tag === 'A') {
-      const url = safeUrl(element.getAttribute('href') || '', element);
+      const href = element.getAttribute('href') || '';
+      const fragment = localFragment(href, element);
+      const url = fragment !== null ? `#${this.ids.get(fragment) || encodeURIComponent(fragment)}` : safeUrl(href, element);
       if (!url) { this.note('LINK_UNAVAILABLE', '有链接缺失或使用不支持的协议，已保留文字。'); return children; }
       return this.link(children, url, element.getAttribute('title') || null);
     }
@@ -182,8 +283,84 @@ class Capture {
       this.note('UNSUPPORTED_EMBED', '有嵌入内容不能从当前页面取得源码，已保留说明。');
       return [text(element.getAttribute('aria-label') || `[${tag.toLowerCase()} 内容未导出]`)];
     }
+    if (tag === 'SPAN' && /^(?:block|flex|grid|list-item)$/.test(layoutStyle(element, 'display'))) return asBlocks(children);
     if (blockTags.has(tag)) return asBlocks(children);
     return children;
+  }
+
+  definitionChildren(element: Element): string {
+    return Array.from(element.children).map(child => {
+      if (child.matches(ignoreSelector) || layoutStyle(child, 'display') === 'none') return '';
+      const tag = child.tagName.toLowerCase();
+      if (tag === 'dt' || tag === 'dd') return `<${tag}${this.attributes(child)}>${asBlocks(this.children(child)).map(part => this.html(part)).join('')}</${tag}>`;
+      return this.definitionChildren(child);
+    }).join('');
+  }
+
+  layout(element: Element): Ast[] | null {
+    if (!element.matches('div,section,article,aside,main') || element.matches('[data-d-inline]')) return null;
+    const columns = layoutColumns(element);
+    if (columns < 0) return null;
+    const direct = Array.from(element.children).filter(child => !child.matches(ignoreSelector) && layoutStyle(child, 'display') !== 'none');
+    if (direct.length < 2 || direct.length > 96 || Array.from(element.childNodes).some(child => child.nodeType === 3 && /\S/.test(child.nodeValue || ''))) return null;
+    const blocks = direct.filter(child => child.matches('div,section,article,aside,p,figure,ul,ol,dl,[data-d-component="box"]'));
+    if (blocks.length < 2) return null; // Compact icon + caption remains inline.
+    const ordered = direct.map((child, index) => ({ child, index, order: Number(layoutStyle(child, 'order')) || 0 })).sort((a, b) => a.order - b.order || a.index - b.index);
+    if (layoutStyle(element, 'flex-direction') === 'row-reverse') ordered.reverse();
+    let width = columns || ordered.length;
+    type Position = { child: Element; row: number; column: number; rowspan: number; colspan: number };
+    let positions: Position[] = ordered.map(({ child }, index) => ({ child, row: Math.floor(index / width) + 1, column: index % width + 1, rowspan: 1, colspan: 1 }));
+    const explicit = columns > 0 && direct.some(child => ['grid-row-start', 'grid-row-end', 'grid-column-start', 'grid-column-end'].some(name => {
+      const value = layoutStyle(child, name as 'grid-row-start'); return !!value && value !== 'auto';
+    }));
+    if (explicit) {
+      const occupied = new Set<string>();
+      const line = (child: Element, name: 'grid-row-start' | 'grid-column-start') => {
+        const value = layoutStyle(child, name); return /^\d{1,2}$/.test(value) && Number(value) >= 1 ? Number(value) : 0;
+      };
+      const span = (child: Element, name: 'grid-row-end' | 'grid-column-end', start: number) => {
+        const value = layoutStyle(child, name);
+        if (!value || value === 'auto') return 1;
+        const match = /^span\s+(\d{1,2})$/.exec(value);
+        return match ? Number(match[1]) : /^\d{1,2}$/.test(value) ? Number(value) - start : 0;
+      };
+      let valid = true;
+      positions = ordered.map(({ child }) => {
+        const row = line(child, 'grid-row-start'), column = line(child, 'grid-column-start');
+        const rowspan = span(child, 'grid-row-end', row), colspan = span(child, 'grid-column-end', column);
+        if (!row || !column || rowspan < 1 || colspan < 1 || row + rowspan > 25 || column + colspan > 25) { valid = false; return { child, row, column, rowspan, colspan }; }
+        for (let y = row; y < row + rowspan; y++) for (let x = column; x < column + colspan; x++) {
+          const key = `${y}:${x}`; if (occupied.has(key)) valid = false; occupied.add(key);
+        }
+        return { child, row, column, rowspan, colspan };
+      });
+      if (!valid) {
+        this.note('LAYOUT_POSITION_FALLBACK', '网格包含命名、自动混排、重叠或超限定位，未推测视觉顺序；已按正文顺序保留内容，请核对原页布局。');
+        return null;
+      }
+      width = Math.max(width, ...positions.map(position => position.column + position.colspan - 1));
+    }
+    const starts = new Map(positions.map(position => [`${position.row}:${position.column}`, position]));
+    const covered = new Set<string>();
+    for (const position of positions) for (let y = position.row; y < position.row + position.rowspan; y++) for (let x = position.column; x < position.column + position.colspan; x++) covered.add(`${y}:${x}`);
+    const rows: string[] = [];
+    const height = Math.max(...positions.map(position => position.row + position.rowspan - 1));
+    for (let row = 1; row <= height; row++) {
+      let cells = '';
+      for (let column = 1; column <= width; column++) {
+        const position = starts.get(`${row}:${column}`);
+        if (!position) { if (!covered.has(`${row}:${column}`)) cells += '<td></td>'; continue; }
+        const { child, rowspan, colspan } = position;
+        const connector = child.getAttribute('data-d-component') === 'icon';
+        const highlight = highlightedCard(child);
+        const className = connector ? 'gpt-md-connector' : 'gpt-md-card' + (highlight ? ' gpt-md-highlight' : '');
+        const fixedStyle = connector ? 'border:0;width:28px;text-align:center;vertical-align:middle;padding:2px' : `border:0;border-radius:8px;text-align:center;vertical-align:middle;padding:8px;background:${highlight ? '#e0efea' : '#f6f8fa'}`;
+        cells += `<td class="${className}"${attrSpan('rowspan', rowspan)}${attrSpan('colspan', colspan)} style="${fixedStyle}">${asBlocks(this.visit(child)).map(part => this.html(part)).join('')}</td>`;
+      }
+      rows.push(`<tr>${cells}</tr>`);
+    }
+    this.note('LAYOUT_AS_TABLE', '横向或网格分组已以 HTML 表格保留；采用文档样式重新排版，阅读器需支持 HTML。', 'info');
+    return [{ type: 'html', block: true, value: `<div class="gpt-md-layout-scroll" style="max-width:100%;overflow-x:auto"><table class="gpt-md-layout" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:8px"><tbody>${rows.join('')}</tbody></table></div>` }];
   }
 
   inlineWrapper(type: string, children: Ast[]): Ast[] {
@@ -301,8 +478,9 @@ class Capture {
     const own = element.getAttribute('data-math-source');
     const inherited = attributeHost?.getAttribute('data-math-source');
     const annotation = element.querySelector('annotation[encoding="application/x-tex"]')?.textContent;
-    const rawSource = own || inherited || annotation || '';
-    const sourceKind: FormulaRecord['sourceKind'] = own || inherited ? 'attribute' : annotation ? 'annotation' : 'missing';
+    const present = (value: string | null | undefined): value is string => !!value?.trim();
+    const rawSource = [own, inherited, annotation].find(present) || '';
+    const sourceKind: FormulaRecord['sourceKind'] = present(own) || present(inherited) ? 'attribute' : present(annotation) ? 'annotation' : 'missing';
     const declared = (element.getAttribute('data-math-type') || element.getAttribute('data-display') || element.getAttribute('data-math-display') || '').trim().toLowerCase();
     const declaredDisplay = /^(?:block|display|true)$/.test(declared) ? true : /^(?:inline|false)$/.test(declared) ? false : undefined;
     const blockLayout = element.matches('.katex-display,.math-display') || !!element.closest('.katex-display,.math-display') || element.getAttribute('display') === 'block';
@@ -311,6 +489,20 @@ class Capture {
     let display = blockLayout || (declaredDisplay ?? !!element.querySelector('math[display="block"]'));
     if (!display && element.getAttribute('role') === 'math') display = (element as HTMLElement).style?.display === 'block';
     if (!rawSource) {
+      const native = element.localName === 'math' ? element : element.querySelector('math');
+      if (native) {
+        try {
+          const markup = serializeNativeMathML(native);
+          this.formulas.push({ rawSource: markup, tex: '', display, sourceKind: 'mathml' });
+          this.note('MATHML_SOURCE_PRESERVED', '有公式使用原生 MathML 保存数学结构；页面未提供 TeX，未推测或改写为 LaTeX。', 'info');
+          return { type: 'html', value: markup, block: display };
+        } catch {
+          const source = originalMathMarkup(native);
+          this.formulas.push({ rawSource: source, tex: '', display, sourceKind: 'mathml' });
+          this.note('MATHML_SOURCE_REJECTED', '有数学结构超出安全支持范围，已将原标记保留为代码，未展平为可能改变含义的文字。');
+          return { type: display ? 'code' : 'inlineCode', lang: display ? 'xml' : undefined, value: source };
+        }
+      }
       const visual = element.querySelector('.katex-html')?.textContent || this.mathVisibleText(element) || element.getAttribute('aria-label');
       this.formulas.push({ rawSource: '', tex: '', display, sourceKind: 'missing' });
       this.note('MATH_SOURCE_MISSING', '有公式没有可确认的 TeX 源码，已保留显示文字；无障碍标签未被当作 LaTeX。');
@@ -323,7 +515,7 @@ class Capture {
       display = unwrapped.display ?? display;
     }
     const tex = unwrapped.tex;
-    const alternatives = [own, inherited, annotation].filter((value): value is string => !!value).map(value => sourceWithoutDelimiters(value).tex);
+    const alternatives = [own, inherited, annotation].filter(present).map(value => sourceWithoutDelimiters(value).tex);
     if (new Set(alternatives).size > 1) this.note('MATH_SOURCE_CONFLICT', '公式源码属性和 TeX 标注不一致，优先采用源码属性；请在预览中核对。');
     this.formulas.push({ rawSource, tex, display, sourceKind });
     if (/\r/.test(tex)) this.note('MATH_LINE_ENDINGS', '公式含回车字符；原串保留，但外部 Markdown 阅读器可能规范化换行。');
@@ -434,14 +626,16 @@ class Capture {
   }
 
   table(element: Element): Ast[] {
-    const sourceRows = Array.from(element.querySelectorAll('tr')).filter(row => row.closest('table') === element);
+    const sourceRows = Array.from(element.querySelectorAll('tr')).filter(row => row.closest('table') === element && !excludedContent(row) && layoutStyle(row, 'display') !== 'none');
     const rows = sourceRows.map(row =>
-      Array.from(row.children).filter(cell => /^(?:TH|TD)$/.test(cell.tagName.toUpperCase())).map(cell => ({
+      Array.from(row.children).filter(cell => /^(?:TH|TD)$/.test(cell.tagName.toUpperCase()) && !excludedContent(cell) && layoutStyle(cell, 'display') !== 'none').map(cell => ({
         header: cell.tagName.toUpperCase() === 'TH',
         colspan: Math.max(1, Number(cell.getAttribute('colspan')) || 1),
         rowspan: Math.max(1, Number(cell.getAttribute('rowspan')) || 1),
         blocks: asBlocks(this.children(cell)),
         align: (cell.getAttribute('align') || (cell as HTMLElement).style?.textAlign || '').match(/^(?:left|center|right)$/)?.[0] || null,
+        scope: /^(?:row|col|rowgroup|colgroup)$/.exec(cell.getAttribute('scope') || '')?.[0] || null,
+        attributes: this.attributes(cell),
       } satisfies Cell)),
     );
     if (!rows.length) return [];
@@ -457,12 +651,14 @@ class Capture {
       || sections.filter(section => section.tagName.toUpperCase() === 'THEAD').length > 1
       || sections.filter(section => section.tagName.toUpperCase() === 'TBODY').length > 1
       || headerRows.length > 1 || (headerRows.length === 1 && headerRows[0] !== sourceRows[0]);
-    const needsFallback = complexSections || rows.some(row => row.some(cell => cell.colspan > 1 || cell.rowspan > 1 || cell.blocks.length > 1 || cell.blocks.some(block => block.type !== 'paragraph') || this.hasTableMathConflict(cell.blocks)));
+    const semanticHeaders = !rows[0].every(cell => cell.header) || rows.slice(1).some(row => row.some(cell => cell.header)) || rows.some(row => row.some(cell => cell.scope));
+    const needsFallback = semanticHeaders || complexSections || sourceRows.some(row => this.attributes(row)) || sections.some(section => this.attributes(section)) || rows.some(row => row.some(cell => cell.attributes || cell.colspan > 1 || cell.rowspan > 1 || cell.blocks.length > 1 || cell.blocks.some(block => block.type !== 'paragraph') || this.hasTableMathConflict(cell.blocks)));
     if (needsFallback) {
-      this.note('TABLE_HTML_FALLBACK', '复杂表格或含竖线等公式的表格已保存为安全 HTML；公式使用原生 MathML 并在 annotation 中保留 LaTeX 源码，阅读器需支持 HTML 和 MathML。');
-      const rowHtml = (row: Cell[]): string => '<tr>' + row.map(cell => {
+      this.note('TABLE_HTML_FALLBACK', '表格已以安全 HTML 保留行列、表头或复杂内容；公式保留可取得的 TeX 或 MathML，阅读器需支持对应格式。', 'info');
+      const rowSource = new Map(rows.map((row, index) => [row, sourceRows[index]]));
+      const rowHtml = (row: Cell[]): string => `<tr${this.attributes(rowSource.get(row)!)}>` + row.map(cell => {
         const tag = cell.header ? 'th' : 'td';
-        return `<${tag}${attrSpan('colspan', cell.colspan)}${attrSpan('rowspan', cell.rowspan)}${cell.align ? ` align="${cell.align}"` : ''}>${cell.blocks.map(part => this.html(part)).join('')}</${tag}>`;
+        return `<${tag}${cell.attributes}${attrSpan('colspan', cell.colspan)}${attrSpan('rowspan', cell.rowspan)}${cell.align ? ` align="${cell.align}"` : ''}${cell.scope ? ` scope="${cell.scope}"` : ''}>${cell.blocks.map(part => this.html(part)).join('')}</${tag}>`;
       }).join('') + '</tr>';
       const groups: Array<{ section: Element | null; rows: Cell[][] }> = [];
       rows.forEach((row, index) => {
@@ -474,7 +670,7 @@ class Capture {
       const html = '<table>\n' + groups.map(group => {
         const content = group.rows.map(rowHtml).join('\n');
         const tag = group.section?.tagName.toLowerCase();
-        return tag ? `<${tag}>\n${content}\n</${tag}>` : content;
+        return tag ? `<${tag}${this.attributes(group.section!)}>\n${content}\n</${tag}>` : content;
       }).join('\n') + '\n</table>';
       return [...prefix, { type: 'html', value: html, block: true }];
     }
@@ -539,7 +735,7 @@ class Capture {
       case 'blockquote': return `<blockquote>${children}</blockquote>`;
       case 'heading': return `<h${Number(node.depth)}>${children}</h${Number(node.depth)}>`;
       case 'list': return node.ordered ? `<ol start="${Number(node.start) || 1}">${children}</ol>` : `<ul>${children}</ul>`;
-      case 'listItem': return `<li>${typeof node.checked === 'boolean' ? `<input type="checkbox" disabled${node.checked ? ' checked' : ''}> ` : ''}${children}</li>`;
+      case 'listItem': return `<li${node.dir ? ` dir="${node.dir}"` : ''}>${typeof node.checked === 'boolean' ? `<input type="checkbox" disabled${node.checked ? ' checked' : ''}> ` : ''}${children}</li>`;
       case 'table': {
         const rows = node.children || [];
         const align = Array.isArray(node.align) ? node.align : [];
@@ -558,10 +754,20 @@ class Capture {
   }
 }
 
-export function extractMarkdown(root: Element): ExportResult {
-  const capture = new Capture();
+export function extractMarkdown(root: Element, options: { idPrefix?: string } = {}): ExportResult {
+  const capture = new Capture(root, options.idPrefix || 'answer');
   // Visit the root as well: callers may supply a pre, table, or formula itself.
   const children = asBlocks(capture.visit(root));
+  // CommonMark HTML blocks terminate at a blank line, including blank lines
+  // inside PRE or a TeX annotation. Character references survive HTML readback
+  // exactly while keeping every generated HTML atom a single Markdown line.
+  const protectHtml = (nodes: Ast[]): void => {
+    for (const part of nodes) {
+      if (part.type === 'html' && part.value) part.value = part.value.replace(/\r/g, '&#13;').replace(/\n/g, '&#10;');
+      if (part.children) protectHtml(part.children);
+    }
+  };
+  protectHtml(children);
   const markdown = serializer.stringify({ type: 'root', children } as unknown as Root);
   return { markdown, diagnostics: capture.diagnostics, formulas: capture.formulas, codeBlocks: capture.codeBlocks };
 }

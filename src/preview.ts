@@ -9,6 +9,7 @@ import rehypeKatex from 'rehype-katex';
 import rehypeStringify from 'rehype-stringify';
 import type { Element, Root, RootContent } from 'hast';
 import type { Diagnostic, PreviewResult } from './types';
+import { nativeMathMlAttributes, nativeMathMlTags, validateNativeMathMLHast } from './native-mathml';
 
 const MAX_PREVIEW_CHARACTERS = 1_000_000;
 const MAX_FORMULA_CHARACTERS = 20_000;
@@ -18,12 +19,20 @@ export interface PreviewOptions { imageAssets?: Record<string, string>; }
 // after this boundary. No page styles, executable markup, or resource loads pass.
 const previewSchema: SanitizeOptions = {
   ...defaultSchema,
+  tagNames: [...new Set([...(defaultSchema.tagNames ?? []), ...nativeMathMlTags, 'ruby', 'rt', 'rp', 'dl', 'dt', 'dd', 'mark', 'bdi', 'bdo'])],
   strip: [...new Set([...(defaultSchema.strip ?? []), 'script', 'style', 'iframe', 'object', 'embed', 'template', 'noscript'])],
   attributes: {
     ...defaultSchema.attributes,
+    ...nativeMathMlAttributes,
+    '*': [
+      ...(defaultSchema.attributes?.['*'] ?? []).filter(attribute => attribute !== 'dir' && attribute !== 'scope'),
+      ['dir', 'ltr', 'rtl', 'auto'],
+    ],
     code: [['className', /^language-./, 'math-inline', 'math-display']],
-    td: [...(defaultSchema.attributes?.td ?? []), 'colSpan', 'rowSpan'],
-    th: [...(defaultSchema.attributes?.th ?? []), 'colSpan', 'rowSpan'],
+    div: [...(defaultSchema.attributes?.div ?? []), ['className', 'gpt-md-layout-scroll']],
+    table: [...(defaultSchema.attributes?.table ?? []), ['className', 'gpt-md-layout']],
+    td: [...(defaultSchema.attributes?.td ?? []), 'colSpan', 'rowSpan', ['className', 'gpt-md-card', 'gpt-md-connector', 'gpt-md-highlight']],
+    th: [...(defaultSchema.attributes?.th ?? []), 'colSpan', 'rowSpan', ['scope', 'row', 'col', 'rowgroup', 'colgroup']],
   },
   protocols: {
     ...defaultSchema.protocols,
@@ -56,10 +65,18 @@ function safeImageLink(value: unknown): string | null {
   }
 }
 
-// HTML-fallback tables use native MathML so external readers need no custom
-// code-class convention. Internally, render their exact TeX through the same
-// bounded KaTeX path as normal Markdown math, without allowing new HTML tags.
-const restoreMathSources: Plugin<[], Root> = () => tree => {
+// Exact plain-text TeX annotations are rebuilt as code before KaTeX, discarding
+// the complete untrusted visual tree. Native math takes the shared DOM/HAST
+// validator instead: the sanitizer's attribute names alone are not a grammar.
+const restoreMathSources: Plugin<[{ diagnostics: Diagnostic[] }], Root> = ({ diagnostics }) => tree => {
+  const mathTags = new Set(nativeMathMlTags);
+  const rejected = (reason: string): Element => {
+    diagnostics.push({
+      code: 'native-mathml-preview-rejected', severity: 'warning',
+      message: `原生 MathML 未通过安全校验，已显示占位；完整 Markdown 源码保持不变：${reason}`,
+    });
+    return element('span', [text('［原生 MathML 无法安全预览；请查看 Markdown 源码］')]);
+  };
   const walk = (parent: Root | Element): void => {
     const children = parent.children as RootContent[];
     for (let index = 0; index < children.length; index += 1) {
@@ -68,12 +85,19 @@ const restoreMathSources: Plugin<[], Root> = () => tree => {
       if (node.tagName === 'math') {
         const semantics = node.children.find(child => child.type === 'element' && child.tagName === 'semantics');
         const annotation = semantics?.type === 'element' ? semantics.children.find(child => child.type === 'element' && child.tagName === 'annotation' && child.properties.encoding === 'application/x-tex') : undefined;
-        if (annotation) {
+        if (annotation && annotation.type === 'element' && annotation.children.every(child => child.type === 'text') && plainText(annotation).trim()) {
           const display = node.properties.display === 'block';
           const code = element('code', [text(plainText(annotation))], { className: ['language-math', display ? 'math-display' : 'math-inline'] });
           children[index] = display ? element('pre', [code]) : code;
           continue;
         }
+        try { validateNativeMathMLHast(node); }
+        catch (error) { children[index] = rejected(error instanceof Error ? error.message : String(error)); }
+        continue;
+      }
+      if (mathTags.has(node.tagName)) {
+        children[index] = rejected('MathML 元素缺少 math 根节点');
+        continue;
       }
       walk(node);
     }
@@ -84,11 +108,22 @@ const restoreMathSources: Plugin<[], Root> = () => tree => {
 const hardenResources: Plugin<[{ diagnostics: Diagnostic[]; imageAssets?: Record<string, string> }], Root> = ({ diagnostics, imageAssets }) => {
   return (tree) => {
     let imageCount = 0;
+    const ids = new Set<string>();
+    const collectIds = (parent: Root | Element): void => {
+      for (const child of parent.children) {
+        if (child.type !== 'element') continue;
+        if (typeof child.properties.id === 'string') ids.add(child.properties.id);
+        collectIds(child);
+      }
+    };
+    collectIds(tree);
     const walk = (parent: Root | Element): void => {
       const children = parent.children as RootContent[];
       for (let index = 0; index < children.length; index += 1) {
         const node = children[index];
         if (node.type !== 'element') continue;
+
+        if (Array.isArray(node.properties.className) && !node.properties.className.length) delete node.properties.className;
 
         if (node.tagName === 'img') {
           const saved = typeof node.properties.src === 'string' ? imageAssets?.[node.properties.src] : undefined;
@@ -108,9 +143,23 @@ const hardenResources: Plugin<[{ diagnostics: Diagnostic[]; imageAssets?: Record
         }
 
         if (node.tagName === 'a') {
-          node.properties.target = '_blank';
-          node.properties.rel = ['noopener', 'noreferrer'];
-          node.properties.referrerPolicy = 'no-referrer';
+          const href = typeof node.properties.href === 'string' ? node.properties.href : '';
+          if (href.trim().startsWith('#')) {
+            let fragment: string | undefined;
+            try { fragment = decodeURIComponent(href.trim().slice(1)); } catch { /* Keep a safe unmatched fragment unchanged. */ }
+            if (fragment !== undefined) {
+              const prefixed = `${defaultSchema.clobberPrefix ?? 'user-content-'}${fragment}`;
+              const target = ids.has(prefixed) ? prefixed : ids.has(fragment) ? fragment : undefined;
+              if (target !== undefined) node.properties.href = `#${encodeURIComponent(target)}`;
+            }
+            delete node.properties.target;
+            delete node.properties.rel;
+            delete node.properties.referrerPolicy;
+          } else {
+            node.properties.target = '_blank';
+            node.properties.rel = ['noopener', 'noreferrer'];
+            node.properties.referrerPolicy = 'no-referrer';
+          }
         }
 
         if (node.tagName === 'code') {
@@ -161,7 +210,7 @@ export async function renderPreview(markdown: string, options: PreviewOptions = 
       .use(remarkMath, { singleDollarTextMath: true })
       .use(remarkRehype, { allowDangerousHtml: true })
       .use(rehypeRaw)
-      .use(restoreMathSources)
+      .use(restoreMathSources, { diagnostics })
       .use(rehypeSanitize, previewSchema)
       .use(hardenResources, { diagnostics, imageAssets: options.imageAssets })
       .use(rehypeKatex, {

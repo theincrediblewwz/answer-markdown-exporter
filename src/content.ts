@@ -6,7 +6,9 @@ import { DIAGNOSTICS_MESSAGE, type PageDiagnostics } from './diagnostics';
 import mathCss from 'katex/dist/katex.min.css';
 import { prepareAssets, zipMarkdown, type PreparedAssets } from './assets';
 import { prepareIconImages } from './icons';
+import { prepareDiagramImages } from './diagrams';
 import { captureCodeSources } from './code-sources';
+import documentCss from './document.css';
 
 type ReadyExport = ExportResult & { assets?: PreparedAssets };
 type ExportSnapshot = { answers: Element[]; changed: boolean };
@@ -163,8 +165,10 @@ class ExportControls {
     const group = node('div'); group.append(...clones);
     const diagnostics = await prepareIconImages(group, { signal: this.assetAbort.signal, current });
     if (!current()) return [];
+    diagnostics.push(...await prepareDiagramImages(group, { signal: this.assetAbort.signal, current }));
+    if (!current()) return [];
     return clones.map((clone, index) => {
-      const result = extractMarkdown(clone);
+      const result = extractMarkdown(clone, { idPrefix: `answer-${index + 1}` });
       return index === 0 ? { ...result, diagnostics: [...diagnostics, ...result.diagnostics] } : result;
     });
   }
@@ -288,11 +292,22 @@ class ExportControls {
   private async preview(result: ReadyExport): Promise<boolean> {
     this.modalHost?.remove();
     const host = node('div'); host.setAttribute(UI_ATTRIBUTE, 'preview'); document.body.append(host); this.modalHost = host;
-    const shadow = host.attachShadow({ mode: 'open' }); shadow.append(node('style', style + previewImageStyle + mathStyles()));
+    const shadow = host.attachShadow({ mode: 'open' }); shadow.append(node('style', style + previewImageStyle + mathStyles() + documentCss));
     const dialog = node('dialog'); const header = node('div'); header.className = 'head';
     const title = node('div'); title.append(node('div', 'Markdown 预览')); title.firstElementChild!.className = 'title';
     const subtitle = node('div', `${result.formulas.length} 个公式 · ${result.codeBlocks.length} 个代码块 · 本地处理`); subtitle.className = 'sub'; title.append(subtitle);
     const actions = node('div'); actions.className = 'actions'; const body = node('div'); body.className = 'body'; body.textContent = '正在渲染…';
+    // Native fragment navigation cannot resolve IDs inside a shadow root.
+    body.addEventListener('click', event => {
+      const link = event.target instanceof Element ? event.target.closest('a[href^="#"]') : null;
+      if (!link || !body.contains(link)) return;
+      let fragment = link.getAttribute('href')!.slice(1);
+      try { fragment = decodeURIComponent(fragment); } catch { /* Literal ID. */ }
+      const target = shadow.getElementById(fragment);
+      if (!target || !body.contains(target)) return;
+      event.preventDefault(); event.stopPropagation(); target.scrollIntoView({ block: 'nearest' });
+      target.setAttribute('tabindex', '-1'); target.focus({ preventScroll: true });
+    });
     const close = () => { dialog.close(); host.remove(); if (this.modalHost === host) this.modalHost = null; };
     let source = false; let html = '';
     const view = button('查看源码', () => { source = !source; view.textContent = source ? '查看预览' : '查看源码'; body.replaceChildren(); if (source) { const area = node('textarea'); area.readOnly = true; area.value = result.markdown; area.setAttribute('aria-label', 'Markdown 源码'); body.append(area); } else body.innerHTML = html; });
@@ -302,7 +317,7 @@ class ExportControls {
     if (result.formulas.length) {
       const details = node('details'); details.append(node('summary', `查看 ${result.formulas.length} 个公式的捕获源码`));
       result.formulas.forEach((formula, index) => {
-        const origin = {attribute:'页面公式源码',annotation:'TeX 标注',missing:'源码缺失'}[formula.sourceKind];
+        const origin = {attribute:'页面公式源码',annotation:'TeX 标注',mathml:'原生 MathML',missing:'源码缺失'}[formula.sourceKind];
         details.append(node('div', `公式 ${index + 1} · ${formula.display ? '块公式' : '行内公式'} · ${origin}`));
         const raw = node('pre', formula.rawSource || '页面未保留可确认的公式源码。'); raw.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 Consolas,monospace;margin:5px 0 12px'; details.append(raw);
       }); notes.append(details);

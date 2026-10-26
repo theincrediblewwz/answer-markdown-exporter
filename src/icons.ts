@@ -1,4 +1,5 @@
 import type { Diagnostic } from './types';
+import { excludedContent } from './content-policy';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const MAX_ICONS = 40;
@@ -120,7 +121,7 @@ async function rasterize(svg: string, document: Document, timeout: number, signa
 export async function prepareIconImages(root: Element, options: { signal?: AbortSignal; current?: () => boolean } = {}): Promise<Diagnostic[]> {
   const diagnostics: Diagnostic[] = [];
   const icons = [...root.querySelectorAll('[data-d-component="icon"]')]
-    .filter(icon => !icon.closest('[data-d-component="pressable"][role="link"]') && (icon.localName === 'svg' || icon.querySelector('svg')));
+    .filter(icon => !excludedContent(icon) && !icon.closest('pre,code,[data-d-component="pressable"][role="link"]') && (icon.localName === 'svg' || icon.querySelector('svg')));
   const deadline = Date.now() + 6_000;
   let converted = 0; let failed = 0;
   for (const icon of icons.slice(0, MAX_ICONS)) {

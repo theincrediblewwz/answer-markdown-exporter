@@ -108,7 +108,8 @@ for (const [label, source] of [
     try {
       assert.equal(result.formulas[0].rawSource, source);
       assert.equal(page.window.document.querySelector('td code')?.textContent, source);
-      assert.ok(result.diagnostics.filter(item => item.severity === 'warning').length >= 2, 'table fallback alone does not explain an unrendered formula');
+      assert.ok(result.diagnostics.some(item => item.code === 'TABLE_HTML_FALLBACK'));
+      assert.ok(result.diagnostics.some(item => item.code === 'TABLE_MATH_SOURCE_FALLBACK' && item.severity === 'warning'), 'table fallback alone does not explain an unrendered formula');
       assert.equal(page.window.document.querySelectorAll('script,img,iframe').length, 0);
     } finally { page.window.close(); }
   });
