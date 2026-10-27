@@ -15,4 +15,30 @@ table.gpt-md-layout>tbody>tr>td.gpt-md-connector img{display:inline-block!import
 .body img{height:auto;object-fit:contain}
 .body pre,#print-content pre{text-align:left}
 .body math[display="block"],#print-content math[display="block"]{display:block math;max-width:100%;overflow-x:auto;overflow-y:hidden;margin:14px 0}
+.gpt-md-group{display:flex;flex-direction:column;gap:8px;min-width:0;max-width:100%;margin:12px 0}
+.gpt-md-group>p,.gpt-md-group>.gpt-md-group{margin:0}
+.gpt-md-group>hr{align-self:stretch;width:100%;min-width:0;margin:8px 0;flex:none;border:0;border-top:1px solid #d7dce2}
+.gpt-md-inline-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:100%}.gpt-md-inline-row>p{margin:0}
+.gpt-md-bordered{border:1px solid #d7dce2;border-radius:10px;padding:12px}
+.gpt-md-surface{background:#f5f7f9;color:#17202d;border-radius:8px;padding:12px}
+.gpt-md-align-left{text-align:left}.gpt-md-align-center{text-align:center}.gpt-md-align-right{text-align:right}
+.body .gpt-md-align-center>p:only-child>img[width="20"][height="20"]:only-child,#print-content .gpt-md-align-center>p:only-child>img[width="20"][height="20"]:only-child{margin:0}
+.gpt-md-small{font-size:.82em}.gpt-md-muted{opacity:.76}.gpt-md-medium{font-weight:550}
+.gpt-md-badge{display:inline-block;white-space:nowrap;border-radius:6px;padding:1px 6px;font-size:.78em;line-height:1.5;background:#edf0f3;color:#314256;vertical-align:middle}
+.gpt-md-badge-success{background:#dcf4e7;color:#216a46}.gpt-md-badge-warning{background:#fff0c9;color:#765500}.gpt-md-badge-danger{background:#fbe1df;color:#8d302b}
+.gpt-md-meter{display:block;width:100%;max-width:100%;height:16px;background:#edf0f2;border-radius:4px;overflow:hidden}
+.gpt-md-meter-fill{display:block;height:100%;border-radius:inherit}
+table.gpt-md-layout.gpt-md-plain-row{min-width:0;border-spacing:2px}
+table.gpt-md-layout>tbody>tr>td.gpt-md-plain-cell{background:transparent;border:0!important;padding:4px!important;vertical-align:middle!important}
+table.gpt-md-layout>tbody>tr>td[align="left"]{text-align:left!important}
+table.gpt-md-layout>tbody>tr>td[align="center"]{text-align:center!important}
+table.gpt-md-layout>tbody>tr>td[align="right"]{text-align:right!important}
+table.gpt-md-plain-row .gpt-md-group,table.gpt-md-plain-row p{margin:0}
+.gpt-md-layout-scroll:has(>table.gpt-md-meter-row){margin:0}
+table.gpt-md-layout.gpt-md-meter-row{border-spacing:0}
+table.gpt-md-layout.gpt-md-meter-row>tbody>tr>td.gpt-md-plain-cell{padding:0 2px!important}
+table.gpt-md-layout.gpt-md-meter-row>tbody>tr>td>p{margin:0;line-height:1.4}
+.body pre{max-width:100%;tab-size:4;overflow-wrap:normal;word-break:normal;direction:ltr}
+.body code.gpt-md-inline-code,#print-content code.gpt-md-inline-code{white-space:pre-wrap;tab-size:4}
 @media print{.gpt-md-layout-scroll{overflow:visible;break-inside:avoid-page}table.gpt-md-layout{min-width:0}.gpt-md-layout-scroll img{max-height:220mm}}
+@media print{.gpt-md-group:is(.gpt-md-bordered,.gpt-md-surface):not(:has(.gpt-md-group,table,pre)){break-inside:avoid-page;page-break-inside:avoid}}

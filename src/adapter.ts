@@ -1,3 +1,5 @@
+import { codeBlockSelector, codeSourcePayload, codeSourcePlacement, excludedCodeContent, ownedCodeElements, ownedCodeSource } from './code-dom';
+
 export const UI_ATTRIBUTE = 'data-gpt-md-ui';
 // Both forms are observed GPT response roots: the message-role layout and the
 // newer server-rendered transcript's explicit assistant Markdown container.
@@ -60,17 +62,71 @@ export function answerBodyElements(answer: Element): Element[] {
 }
 export function cloneAnswerContent(answer: Element, codeSources?: ReadonlyMap<Element, Element>): Element {
   const copyBody = (body: Element): Element => {
-    const snapshot = codeSources?.get(body);
-    const copied = (snapshot || body).cloneNode(true) as Element;
-    if (!codeSources || snapshot) { annotateLayout(body, copied); return copied; }
-    const selector = '[data-code-block="true"][data-markdown-copy="code-block"]';
-    const originals = Array.from(body.querySelectorAll(selector));
-    const copies = Array.from(copied.querySelectorAll(selector));
-    for (let index = 0; index < originals.length; index += 1) {
-      const saved = codeSources.get(originals[index]);
-      if (saved) copies[index]?.replaceWith(saved.cloneNode(true));
-    }
+    const copied = body.cloneNode(true) as Element;
+    // Capture live facts while original/copy topology still matches, then
+    // restore only owned source subtrees. A parent snapshot must never replace
+    // newer prose or child widgets, and a deep widget chain is cloned once.
     annotateLayout(body, copied);
+    if (!codeSources?.size) return copied;
+    if (codeSources.size > 100) throw new Error('代码快照数量超过限额，请分段导出。');
+    const originals = [...(body.matches(codeBlockSelector) ? [body] : []), ...body.querySelectorAll(codeBlockSelector)];
+    const copies = [...(copied.matches(codeBlockSelector) ? [copied] : []), ...copied.querySelectorAll(codeBlockSelector)];
+    for (let index = 0; index < originals.length; index += 1) {
+      const saved = codeSources.get(originals[index]), target = copies[index];
+      if (!saved || !target) continue;
+      const source = ownedCodeSource(saved);
+      if (!source) continue;
+      const payload = codeSourcePayload(source);
+      let restored = payload.cloneNode(true) as Element;
+      const current = ownedCodeSource(target);
+      if (current && !excludedCodeContent(current)) {
+        if (source.querySelector(codeBlockSelector) || current.querySelector(codeBlockSelector)) {
+          const savedCodes = ownedCodeElements(source), currentCodes = ownedCodeElements(current);
+          if (savedCodes.length !== 1 || currentCodes.length !== 1) throw new Error('嵌套代码的源码归属无法确认，请分段导出。');
+          currentCodes[0].replaceWith(savedCodes[0].cloneNode(true));
+        } else current.replaceWith(restored);
+        continue;
+      }
+      if (current) {
+        if (current.querySelector(codeBlockSelector)) throw new Error('嵌套代码的可见容器已改变，请重新准备导出。');
+        current.remove();
+      }
+      const origin = originals[index], placement = codeSourcePlacement(saved);
+      const inOwner = (node: Element) => (node === origin || origin.contains(node))
+        && (node === origin || node.closest(codeBlockSelector) === origin);
+      const copyOf = (live: Element): Element => {
+        const path: number[] = [];
+        for (let child = live; child !== origin; child = child.parentElement!) {
+          if (!child.parentElement || path.length >= 128) throw new Error('代码位置无法确认，请重新导出。');
+          path.unshift(Array.from(child.parentElement.children).indexOf(child));
+        }
+        let mapped = target;
+        for (const position of path) {
+          const next = mapped.children[position];
+          if (!next) throw new Error('代码容器在准备期间改变，请等待页面稳定后重新导出。');
+          mapped = next;
+        }
+        return mapped;
+      };
+      if (placement && inOwner(placement.target) && !excludedCodeContent(placement.target)) {
+        copyOf(placement.target).replaceWith(restored); continue;
+      }
+      if (placement) {
+        const frame = placement.frames.find(step => inOwner(step.parent) && !excludedCodeContent(step.parent));
+        if (!frame) throw new Error('代码的可见容器已经改变，请重新导出。');
+        const parent = copyOf(frame.parent);
+        if (payload !== source && !frame.parent.matches('pre,.cm-content,[data-code-block-source="true"]')) {
+          const wrapper = source.cloneNode(false) as Element; wrapper.append(restored); restored = wrapper;
+        }
+        const livePosition = frame.before?.parentElement === frame.parent ? Array.from(frame.parent.children).indexOf(frame.before)
+          : frame.after?.parentElement === frame.parent ? Array.from(frame.parent.children).indexOf(frame.after) + 1 : frame.index;
+        parent.insertBefore(restored, parent.children[Math.min(livePosition, parent.children.length)] || null);
+        continue;
+      }
+      // Manually supplied maps have no original-node identity. They may replace
+      // an existing owned source, but stale index/tag paths are never guessed.
+      throw new Error('代码快照缺少可确认的原始位置，请重新准备导出。');
+    }
     return copied;
   };
   let clone: Element;

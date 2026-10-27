@@ -8,6 +8,8 @@ import type { CodeRecord, Diagnostic, ExportResult, FormulaRecord } from './type
 import { serializeNativeMathML } from './native-mathml';
 import { highlightedCard, layoutColumns, layoutStyle } from './layout';
 import { ignoredContentSelector, excludedContent } from './content-policy';
+import { codeBlockSelector, codeSourceSelector, codeText, codeLineText, excludedCodeContent, inlineCodeMarkup, ownedCodeElements, ownedCodeSource, ownsCodeDescendant } from './code-dom';
+import { contentAlignment, fixedColumnWidth, groupAttributes, meterMarkup } from './presentation';
 
 /** An internal, small mdast builder. No page-owned nodes are changed. */
 interface Ast {
@@ -33,12 +35,6 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 function attrSpan(name: string, value: number): string { return value > 1 ? ` ${name}="${value}"` : ''; }
-function codeText(node: Node): string {
-  if (node.nodeType === 3) return node.nodeValue || '';
-  if (node.nodeType !== 1) return '';
-  if ((node as Element).tagName.toUpperCase() === 'BR') return '\n';
-  return Array.from(node.childNodes).map(codeText).join('');
-}
 function trimmedPhrasing(nodes: Ast[]): Ast[] {
   const copy = [...nodes];
   while (copy[0]?.type === 'text') {
@@ -180,9 +176,10 @@ class Capture {
     }
     if (node.nodeType !== 1) return [];
     const element = node as Element;
-    if (element.matches(ignoreSelector)) return [];
+    if (excludedContent(element)) return [];
+    if (element.matches(`pre,code,kbd,samp,.cm-editor,.cm-scroller,.cm-content,.cm-line,${codeSourceSelector},${codeBlockSelector}`) && excludedCodeContent(element)) return [];
     if (element.hasAttribute('data-gpt-md-layout-incomplete')) this.note('LAYOUT_CAPTURE_LIMIT', '部分布局信息超过采集数量限额，已保留可取得的正文结构；请核对较长回答。');
-    if (layoutStyle(element, 'display') === 'none') return [];
+    if (layoutStyle(element, 'display') === 'none' || /^(?:hidden|collapse)$/.test(layoutStyle(element, 'visibility'))) return [];
     // GPT wraps answer images in a zoom button. Keep only its image children;
     // the button's label and interaction chrome are never answer content.
     if (element.matches(messageImageButton)) {
@@ -195,10 +192,17 @@ class Capture {
     if (renderedCode) return [renderedCode];
     const codeMirror = this.codeMirror(element);
     if (codeMirror) return [codeMirror];
-    if (element.matches('[data-code-block="true"][data-markdown-copy="code-block"]')
-      && !element.querySelector('[data-code-block-source="true"] code,pre code')) {
+    if (element.matches(codeBlockSelector) && !ownedCodeSource(element)) {
       this.note('CODE_SOURCE_NOT_LOADED', '有代码块尚未加载，未取得源码；已保留代码位置，请在原页加载后重试。');
-      return [...asBlocks(this.children(element)), { type: 'paragraph', children: [text('[代码块尚未加载，未取得源码]')] }];
+      // DIL widgets have an unmarked language/header skeleton; it is not prose.
+      const children = element.matches('[data-d-component="code_block"]')
+        ? this.codeWidgetParts(element).flatMap(part => this.visit(part))
+        : asBlocks(this.children(element));
+      return [...children, { type: 'paragraph', children: [text('[代码块尚未加载，未取得源码]')] }];
+    }
+    if (element.matches('[data-d-component="code_block"]')) {
+      const source = ownedCodeSource(element);
+      return this.codeWidgetParts(element, source).flatMap(part => this.visit(part));
     }
     const formula = this.formula(element);
     if (formula) return [formula];
@@ -209,13 +213,21 @@ class Capture {
     const component = this.component(element);
     if (component) return component;
     const tag = element.tagName.toUpperCase();
-    if (tag === 'PRE') return [this.code(element)];
+    if (tag === 'PRE') { const code = this.code(element); return code ? [code] : []; }
     if (tag === 'CODE' || tag === 'KBD' || tag === 'SAMP') {
+      const source = tag === 'CODE' ? element.closest(codeSourceSelector) : null;
+      if (source && ownsCodeDescendant(source, element)) {
+        const code = this.code(element, this.language([source]) || this.codeHeaderLanguage(source.closest(codeBlockSelector), source));
+        return code ? [code] : [];
+      }
+      if (tag === 'CODE' && layoutStyle(element, 'display') === 'block' && !element.closest('p,h1,h2,h3,h4,h5,h6')) {
+        const code = this.code(element);
+        return code ? [code] : [];
+      }
       const value = codeText(element);
       if (/[\r\n]/.test(value)) {
-        this.note('MULTILINE_INLINE_CODE', '多行行内代码已保留为代码块，避免 Markdown 折叠内部换行。');
-        this.codeBlocks.push({ text: value, language: null });
-        return [{ type: 'code', lang: null, value }];
+        this.note('MULTILINE_INLINE_CODE', '多行行内代码已以安全 HTML 保留段落位置和内部换行，阅读器需支持对应格式。');
+        return [{ type: 'html', value: inlineCodeMarkup(value) }];
       }
       return [{ type: 'inlineCode', value }];
     }
@@ -304,9 +316,18 @@ class Capture {
     const direct = Array.from(element.children).filter(child => !child.matches(ignoreSelector) && layoutStyle(child, 'display') !== 'none');
     if (direct.length < 2 || direct.length > 96 || Array.from(element.childNodes).some(child => child.nodeType === 3 && /\S/.test(child.nodeValue || ''))) return null;
     const blocks = direct.filter(child => child.matches('div,section,article,aside,p,figure,ul,ol,dl,[data-d-component="box"]'));
-    if (blocks.length < 2) return null; // Compact icon + caption remains inline.
+    const dilRow = element.getAttribute('data-d-component') === 'row';
+    const compactIconText = direct.length === 2 && direct.some(child => child.getAttribute('data-d-component') === 'icon')
+      && direct.some(child => child.matches('[data-d-component="text"],[data-d-component="title"]'));
+    if (blocks.length < 2 && (!dilRow || compactIconText)) return null;
+    const plainRow = dilRow && (blocks.length < 2 || !direct.every(child => child.matches('[data-d-component="box"],[data-d-component="icon"]')));
+    const meterRow = plainRow && direct.some(child => meterMarkup(child) !== null);
     const ordered = direct.map((child, index) => ({ child, index, order: Number(layoutStyle(child, 'order')) || 0 })).sort((a, b) => a.order - b.order || a.index - b.index);
     if (layoutStyle(element, 'flex-direction') === 'row-reverse') ordered.reverse();
+    if (dilRow && direct.some(child => child.getAttribute('data-d-component') === 'badge')
+      && direct.every(child => child.matches('[data-d-component="text"],[data-d-component="title"],[data-d-component="badge"]'))) {
+      return [{ type: 'html', block: true, value: `<div class="gpt-md-inline-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:100%">${ordered.flatMap(({ child }) => asBlocks(this.visit(child))).map(part => this.html(part)).join('')}</div>` }];
+    }
     let width = columns || ordered.length;
     type Position = { child: Element; row: number; column: number; rowspan: number; colspan: number };
     let positions: Position[] = ordered.map(({ child }, index) => ({ child, row: Math.floor(index / width) + 1, column: index % width + 1, rowspan: 1, colspan: 1 }));
@@ -353,14 +374,20 @@ class Capture {
         const { child, rowspan, colspan } = position;
         const connector = child.getAttribute('data-d-component') === 'icon';
         const highlight = highlightedCard(child);
-        const className = connector ? 'gpt-md-connector' : 'gpt-md-card' + (highlight ? ' gpt-md-highlight' : '');
-        const fixedStyle = connector ? 'border:0;width:28px;text-align:center;vertical-align:middle;padding:2px' : `border:0;border-radius:8px;text-align:center;vertical-align:middle;padding:8px;background:${highlight ? '#e0efea' : '#f6f8fa'}`;
-        cells += `<td class="${className}"${attrSpan('rowspan', rowspan)}${attrSpan('colspan', colspan)} style="${fixedStyle}">${asBlocks(this.visit(child)).map(part => this.html(part)).join('')}</td>`;
+        const align = contentAlignment(child) || (plainRow ? 'left' : 'center');
+        const className = plainRow ? 'gpt-md-plain-cell' : connector ? 'gpt-md-connector' : 'gpt-md-card' + (highlight ? ' gpt-md-highlight' : '');
+        const columnWidth = plainRow ? fixedColumnWidth(child) : null;
+        const widthAttribute = columnWidth ? ` width="${columnWidth}"` : '';
+        const fixedStyle = plainRow ? `border:0;padding:${meterRow ? '0 2px' : '4px'};vertical-align:middle;text-align:${align}${columnWidth ? `;width:${columnWidth}px` : ''}`
+          : connector ? 'border:0;width:28px;text-align:center;vertical-align:middle;padding:2px' : `border:0;border-radius:8px;text-align:${align};vertical-align:middle;padding:8px;background:${highlight ? '#e0efea' : '#f6f8fa'}`;
+        const content = asBlocks(this.visit(child)).map(part => meterRow && part.type === 'paragraph'
+          ? `<p style="margin:0;line-height:1.4">${(part.children || []).map(child => this.html(child)).join('')}</p>` : this.html(part)).join('');
+        cells += `<td class="${className}" align="${align}"${widthAttribute}${attrSpan('rowspan', rowspan)}${attrSpan('colspan', colspan)} style="${fixedStyle}">${content}</td>`;
       }
       rows.push(`<tr>${cells}</tr>`);
     }
     this.note('LAYOUT_AS_TABLE', '横向或网格分组已以 HTML 表格保留；采用文档样式重新排版，阅读器需支持 HTML。', 'info');
-    return [{ type: 'html', block: true, value: `<div class="gpt-md-layout-scroll" style="max-width:100%;overflow-x:auto"><table class="gpt-md-layout" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:8px"><tbody>${rows.join('')}</tbody></table></div>` }];
+    return [{ type: 'html', block: true, value: `<div class="gpt-md-layout-scroll" style="max-width:100%;overflow-x:auto${meterRow ? ';margin:0' : ''}"><table class="gpt-md-layout${plainRow ? ' gpt-md-plain-row' : ''}${meterRow ? ' gpt-md-meter-row' : ''}" style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:${meterRow ? '0' : plainRow ? '2' : '8'}px"><tbody>${rows.join('')}</tbody></table></div>` }];
   }
 
   inlineWrapper(type: string, children: Ast[]): Ast[] {
@@ -418,6 +445,32 @@ class Capture {
   component(element: Element): Ast[] | null {
     const component = element.getAttribute('data-d-component');
     if (!component) return null;
+    if (component === 'divider') return [{ type: 'thematicBreak' }];
+    if (component === 'badge') {
+      const color = element.getAttribute('data-color');
+      const tone = color && ['success', 'warning', 'danger'].includes(color) ? ` gpt-md-badge-${color}` : '';
+      const parts = this.children(element);
+      if (!parts.every(part => isInline(part) || (part.type === 'paragraph' && part.children?.every(isInline)))) {
+        this.note('BADGE_BLOCK_CONTENT', '徽标包含独立块内容，已按内容组保留，避免将代码或表格塞入行内标记。', 'info');
+        return [{ type: 'html', block: true, value: `<div class="gpt-md-group">${asBlocks(parts).map(part => this.html(part)).join('')}</div>` }];
+      }
+      const inline = parts.flatMap((part, index) => [
+        ...(index && (part.type === 'paragraph' || parts[index - 1].type === 'paragraph') ? [text(' ')] : []),
+        ...(part.type === 'paragraph' ? part.children || [] : [part]),
+      ]);
+      return [{ type: 'html', value: `<span class="gpt-md-badge${tone}">${inline.map(part => this.html(part)).join('')}</span>` }];
+    }
+    if (component === 'text' || component === 'caption') {
+      let children = this.children(element);
+      if (element.hasAttribute('data-d-default-strong') || /^(?:bold|semibold)$/.test(element.getAttribute('data-d-weight') || '')) children = this.inlineWrapper('strong', children);
+      const classes = [];
+      if (/^(?:2xs|xs|sm)$/.test(element.getAttribute('data-d-size') || '') || component === 'caption') classes.push('gpt-md-small');
+      if (component === 'caption' || /secondary/.test((element as HTMLElement).style?.color || '')) classes.push('gpt-md-muted');
+      if (element.getAttribute('data-d-weight') === 'medium') classes.push('gpt-md-medium');
+      if (classes.length && children.every(isInline)) children = [{ type: 'html', value: `<span class="${classes.join(' ')}">${children.map(part => this.html(part)).join('')}</span>` }];
+      if (element.tagName.toUpperCase() === 'P' || component === 'caption') return asBlocks(children);
+      return children;
+    }
     if (component === 'icon') {
       const raster = element.querySelector('img[data-gpt-md-icon-image]');
       const source = raster?.getAttribute('src') || '';
@@ -446,8 +499,9 @@ class Capture {
       this.note('IMAGE_NOT_LOADED', '有图片仍是加载占位，当前页面未提供可保存的图片资源；请先让图片在原页完成加载。');
       return [{ type: 'paragraph', children: [text('[图片尚未加载，未取得可保存资源]')] }];
     }
-    if (component === 'caption') return asBlocks(this.children(element));
     if ((component === 'box' || component === 'row') && !element.hasAttribute('data-d-inline')) {
+      const meter = meterMarkup(element);
+      if (meter) return [{ type: 'html', block: true, value: meter }];
       const converted = this.children(element);
       if (component === 'row' && !element.hasAttribute('data-d-has-border')) {
         const direct = Array.from(element.children).filter(child => !child.matches(ignoreSelector));
@@ -462,9 +516,19 @@ class Capture {
         }
       }
       const children = asBlocks(converted);
-      // A bordered card remains a grouped block in portable Markdown. Layout
-      // classes and vector paths are never copied into the generated document.
-      if (component === 'box' && element.hasAttribute('data-d-has-border')) return children.length ? [{ type: 'blockquote', children }] : [];
+      // Cards are presentation groups, not quotations. Rebuild a bounded
+      // document-owned wrapper rather than flattening their visual hierarchy.
+      if (component === 'box' || element.getAttribute('data-d-justify') === 'center') {
+        const attributes = groupAttributes(element);
+        const styledBox = element.hasAttribute('data-d-direction') || element.hasAttribute('data-d-has-border')
+          || /^(?:inline-)?(?:flex|grid)$/.test(layoutStyle(element, 'display'))
+          || /[1-9]/.test(layoutStyle(element, 'gap')) || contentAlignment(element) !== null || attributes.includes('gpt-md-surface') || attributes.includes('gpt-md-bordered');
+        if (component === 'box' && !styledBox) return children;
+        const centered = component === 'row' ? ' class="gpt-md-align-center" style="text-align:center"' : '';
+        return children.length ? [{ type: 'html', block: true, value: component === 'row'
+          ? `<div${centered}>${children.map(child => this.html(child)).join('')}</div>`
+          : `<div ${attributes}>${children.map(child => this.html(child)).join('')}</div>` }] : [];
+      }
       return children;
     }
     return null;
@@ -535,30 +599,39 @@ class Capture {
   codeMirror(element: Element): Ast | null {
     let content: Element | null = null;
     if (element.matches('.cm-content,.cm-line')) content = element;
-    else if (element.matches('pre,.cm-editor,.cm-scroller,[data-markdown-copy="code-block"]')) {
-      const contents = Array.from(element.querySelectorAll('.cm-content'));
+    else if (element.matches(`pre,.cm-editor,.cm-scroller,[data-markdown-copy="code-block"],${codeSourceSelector}`)) {
+      const contents = Array.from(element.querySelectorAll('.cm-content')).filter(candidate => ownsCodeDescendant(element, candidate));
       // Do not collapse two distinct editors into one apparent code block.
-      if (contents.length === 1) content = contents[0];
+      const sourceOnly = (node: Node): boolean => {
+        if (node === contents[0]) return true;
+        if (node.nodeType === 3) return !/\S/.test(node.nodeValue || '');
+        if (node.nodeType !== 1) return true;
+        const child = node as Element;
+        if (excludedCodeContent(child) || child.matches('.cm-gap')) return true;
+        return Array.from(child.childNodes).every(sourceOnly);
+      };
+      if (contents.length === 1 && sourceOnly(element)) content = contents[0];
     } else {
-      const directChildren = Array.from(element.children);
+      const directChildren = Array.from(element.children).filter(child => !excludedCodeContent(child));
       const lines = directChildren.filter(child => child.matches('.cm-line'));
-      const hasOtherContent = directChildren.some(child => !child.matches('.cm-line') && !child.matches(ignoreSelector));
+      const hasOtherContent = directChildren.some(child => !child.matches('.cm-line,.cm-gap'));
       const hasLooseText = Array.from(element.childNodes).some(node => node.nodeType === 3 && /\S/.test(node.nodeValue || ''));
       if (lines.length && !hasOtherContent && !hasLooseText) content = element;
     }
-    if (!content) return null;
-    const clone = content.cloneNode(true) as Element;
-    clone.querySelectorAll(`${ignoreSelector},.cm-gutters,.cm-gutter,.cm-placeholder`).forEach(node => node.remove());
-    const lines = clone.matches('.cm-line') ? [clone] : Array.from(clone.querySelectorAll('.cm-line')).filter(line => !line.parentElement?.closest('.cm-line'));
-    const lineText = (line: Element): string => {
-      const value = codeText(line);
-      // A lone BR is CodeMirror's empty-line placeholder, not another line.
-      return value === '\n' && !line.textContent ? '' : value;
-    };
-    const value = lines.length ? lines.map(lineText).join('\n') : codeText(clone);
+    if (!content || excludedCodeContent(content) || content.querySelector(codeBlockSelector)) return null;
+    if (Array.from(content.querySelectorAll('.cm-gap')).some(gap => ownsCodeDescendant(content!, gap) && !excludedCodeContent(gap))) {
+      this.note('CODE_SOURCE_INCOMPLETE', '有代码编辑器仅提供部分已加载行，未取得全部源码；已保留当前可读取的代码，请在原页完整加载后重试。');
+    }
     const language = this.language([
       content, element, content.closest('.cm-editor'), content.closest('[data-markdown-copy="code-block"]'),
-    ]);
+    ]) || this.codeHeaderLanguage(content.closest(codeBlockSelector), content);
+    const codes = ownedCodeElements(content);
+    if (codes.length) return this.code(content, language);
+    const lines = content.matches('.cm-line') ? [content] : Array.from(content.querySelectorAll('.cm-line')).filter(line =>
+      ownsCodeDescendant(content!, line) && !excludedCodeContent(line)
+      && !line.parentElement?.closest('.cm-line')
+      && (!content!.matches('.cm-content') || line.closest('.cm-content') === content));
+    const value = lines.length ? lines.map(codeLineText).join('\n') : codeText(content, true);
     this.codeBlocks.push({ text: value, language });
     if (/\r/.test(value)) this.note('CODE_LINE_ENDINGS', '代码含回车字符，外部 Markdown 阅读器可能规范化为 LF。');
     return { type: 'code', lang: language, value };
@@ -566,7 +639,7 @@ class Capture {
 
   language(elements: Array<Element | null>): string | null {
     for (const element of elements) {
-      if (!element) continue;
+      if (!element || excludedCodeContent(element)) continue;
       const explicit = element.getAttribute('data-language');
       const className = element.getAttribute('class')?.match(/(?:^|\s)language-([^\s]+)/)?.[1];
       const candidate = explicit || className;
@@ -575,25 +648,73 @@ class Capture {
     return null;
   }
 
-  renderedCodeBlock(element: Element): Ast | null {
-    // Current GPT code surfaces use a marked source DIV rather than PRE.
-    // Consume only a self-contained surface with its own controls and label.
-    if (element.matches('[data-code-block="true"][data-markdown-copy="code-block"]')) {
-      const parts = Array.from(element.children);
-      const source = parts.find(child => child.matches('[data-code-block-source="true"]'));
-      const header = parts.find(child => child.matches('[data-markdown-copy="exclude"]'));
-      const labels = Array.from(header?.children || []).filter(child => child.tagName.toUpperCase() === 'DIV'
-        && !child.childElementCount && !child.hasAttribute('data-code-block-controls') && !child.matches(ignoreSelector));
-      const label = labels.length === 1 ? labels[0].textContent?.trim() : null;
-      const looseText = Array.from(element.childNodes).some(child => child.nodeType === 3 && /\S/.test(child.nodeValue || ''));
-      const sourceOnly = source?.childElementCount === 1 && !source.matches(ignoreSelector)
-        && source.firstElementChild?.tagName.toUpperCase() === 'CODE' && !source.firstElementChild.matches(ignoreSelector)
-        && !Array.from(source.childNodes).some(child => child.nodeType === 3 && /\S/.test(child.nodeValue || ''));
-      if (sourceOnly && header?.querySelector('[data-code-block-controls="true"]')
-        && label && /^[\w.+#-]+$/.test(label) && !looseText
-        && parts.every(child => child === source || child === header || child.matches(ignoreSelector))) {
-        return this.code(source, this.language([element]) || label.toLowerCase());
+  codeHeaderLanguage(block: Element | null, source: Element): string | null {
+    if (!block) return null;
+    const explicit = this.language([block]);
+    if (explicit) return explicit;
+    const hidden = (element: Element): boolean => {
+      for (let current: Element | null = element; current && current !== block; current = current.parentElement) {
+        if (current.matches('[hidden],[inert],[aria-hidden="true"],[data-gpt-md-ignore]')
+          || layoutStyle(current, 'display') === 'none' || /^(?:hidden|collapse)$/.test(layoutStyle(current, 'visibility'))) return true;
       }
+      return false;
+    };
+    const header = Array.from(block.children).find(child => child.matches('[data-markdown-copy="exclude"]'));
+    if (header && !hidden(header) && Array.from(header.querySelectorAll('[data-code-block-controls="true"]')).some(control => ownsCodeDescendant(block, control) && !hidden(control))) {
+      const labels = Array.from(header.children).filter(child => child.tagName.toUpperCase() === 'DIV'
+        && !child.childElementCount && !child.hasAttribute('data-code-block-controls') && !hidden(child));
+      const label = labels.length === 1 ? labels[0].textContent?.trim() : null;
+      if (label && /^[\w.+#-]+$/.test(label)) return label.toLowerCase();
+    }
+    if (!block.matches('[data-d-component="code_block"]')) return null;
+    // Observed DIL headers pair a plain language label with their own Copy button.
+    // Never borrow prose elsewhere in the widget or outside its source owner.
+    const labelText = (element: Element): string | null => {
+      if (!element.matches('div,span') || excludedCodeContent(element)) return null;
+      const read = (node: Node): string | null => {
+        if (node.nodeType === 3) return node.nodeValue || '';
+        if (node.nodeType !== 1) return '';
+        const child = node as Element;
+        if (excludedCodeContent(child)) return '';
+        if (!child.matches('span')) return null;
+        const parts = Array.from(child.childNodes).map(read);
+        return parts.some(part => part === null) ? null : parts.join('');
+      };
+      const parts = Array.from(element.childNodes).map(read);
+      const label = parts.some(part => part === null) ? '' : parts.join('').trim();
+      return /^[\w.+#-]+$/.test(label) ? label.toLowerCase() : null;
+    };
+    for (const button of block.querySelectorAll('button[aria-label]')) {
+      if (!ownsCodeDescendant(block, button) || hidden(button) || !/^(?:复制(?:代码)?|copy(?: code)?)$/i.test(button.getAttribute('aria-label')?.trim() || '')) continue;
+      for (let container = button.parentElement; container && container !== block && !container.contains(source); container = container.parentElement) {
+        const candidates = Array.from(container.children).filter(child => !child.contains(button) && !hidden(child));
+        const labels = candidates.map(labelText).filter((label): label is string => label !== null);
+        if (labels.length === 1 && candidates.length === 1) return labels[0];
+      }
+    }
+    return null;
+  }
+
+  codeWidgetParts(block: Element, source?: Element): Element[] {
+    const candidates = [...(source ? [source] : []), ...Array.from(block.querySelectorAll(`${codeBlockSelector},p,blockquote,ul,ol,table,h1,h2,h3,h4,h5,h6`)).filter(part =>
+      !source?.contains(part) && (part.matches(codeBlockSelector)
+        ? part.parentElement?.closest(codeBlockSelector) === block : ownsCodeDescendant(block, part)))];
+    return candidates.filter(part => !candidates.some(parent => parent !== part && parent.contains(part)))
+      .sort((left, right) => left.compareDocumentPosition(right) & 2 ? 1 : -1);
+  }
+
+  renderedCodeBlock(element: Element): Ast | null {
+    // Source semantics do not depend on a header or on containing multiple lines.
+    if (element.matches(codeSourceSelector)) {
+      if (element.querySelector(codeBlockSelector)) return null;
+      return this.codeMirror(element) || this.code(element, this.codeHeaderLanguage(element.closest(codeBlockSelector), element));
+    }
+    if (element.matches('[data-d-component="code_block"]')) {
+      if (element.querySelector(codeBlockSelector)) return null;
+      const source = ownedCodeSource(element);
+      if (this.codeWidgetParts(element, source).some(part => part !== source)) return null;
+      return source && !excludedCodeContent(source)
+        ? this.codeMirror(source) || this.code(source, this.codeHeaderLanguage(element, source)) : null;
     }
     // The current GPT renderer puts the language beside PRE instead of on CODE.
     // Require its code-control marker and an otherwise self-contained block so
@@ -609,17 +730,15 @@ class Capture {
     return this.code(pre, language);
   }
 
-  code(element: Element, fallbackLanguage: string | null = null): Ast {
-    const code = element.querySelector('code');
-    let value: string;
-    if (code) value = codeText(code);
-    else {
-      const clone = element.cloneNode(true) as Element;
-      clone.querySelectorAll(ignoreSelector).forEach(node => node.remove());
-      const lines = Array.from(clone.querySelectorAll('.cm-line'));
-      value = lines.length ? lines.map(codeText).join('\n') : codeText(clone);
-    }
-    const language = this.language([code, element]) || fallbackLanguage;
+  code(element: Element, fallbackLanguage: string | null = null): Ast | null {
+    if (excludedCodeContent(element)) return null;
+    const codes = ownedCodeElements(element);
+    const visibleCodes = codes.filter(candidate => !excludedCodeContent(candidate));
+    if (codes.length && !visibleCodes.length) return null;
+    const code = visibleCodes.length === 1 ? visibleCodes[0] : undefined;
+    const value = codeText(code || element, true);
+    const language = this.language([code || null, element, element.closest(codeSourceSelector)]) || fallbackLanguage
+      || this.codeHeaderLanguage(element.closest(codeBlockSelector), element);
     this.codeBlocks.push({ text: value, language });
     if (/\r/.test(value)) this.note('CODE_LINE_ENDINGS', '代码含回车字符，外部 Markdown 阅读器可能规范化为 LF。');
     return { type: 'code', lang: language, value };
@@ -731,7 +850,7 @@ class Capture {
       case 'inlineMath':
       case 'math': return this.tableMath(node);
       case 'break': return '<br>';
-      case 'thematicBreak': return '<hr>';
+      case 'thematicBreak': return '<hr style="align-self:stretch;width:100%;border:0;border-top:1px solid #d7dce2;margin:8px 0">';
       case 'blockquote': return `<blockquote>${children}</blockquote>`;
       case 'heading': return `<h${Number(node.depth)}>${children}</h${Number(node.depth)}>`;
       case 'list': return node.ordered ? `<ol start="${Number(node.start) || 1}">${children}</ol>` : `<ul>${children}</ul>`;

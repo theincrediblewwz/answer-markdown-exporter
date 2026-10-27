@@ -7,9 +7,12 @@ import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema, type Options as SanitizeOptions } from 'rehype-sanitize';
 import rehypeKatex from 'rehype-katex';
 import rehypeStringify from 'rehype-stringify';
-import type { Element, Root, RootContent } from 'hast';
+import type { Element, Root, RootContent, Text } from 'hast';
 import type { Diagnostic, PreviewResult } from './types';
 import { nativeMathMlAttributes, nativeMathMlTags, validateNativeMathMLHast } from './native-mathml';
+import { presentationClasses } from './presentation';
+
+declare module 'hast' { interface ElementData { gptMdLiteralMath?: boolean; } }
 
 const MAX_PREVIEW_CHARACTERS = 1_000_000;
 const MAX_FORMULA_CHARACTERS = 20_000;
@@ -28,10 +31,11 @@ const previewSchema: SanitizeOptions = {
       ...(defaultSchema.attributes?.['*'] ?? []).filter(attribute => attribute !== 'dir' && attribute !== 'scope'),
       ['dir', 'ltr', 'rtl', 'auto'],
     ],
-    code: [['className', /^language-./, 'math-inline', 'math-display']],
-    div: [...(defaultSchema.attributes?.div ?? []), ['className', 'gpt-md-layout-scroll']],
-    table: [...(defaultSchema.attributes?.table ?? []), ['className', 'gpt-md-layout']],
-    td: [...(defaultSchema.attributes?.td ?? []), 'colSpan', 'rowSpan', ['className', 'gpt-md-card', 'gpt-md-connector', 'gpt-md-highlight']],
+    code: [['className', /^language-./, 'math-inline', 'math-display', 'gpt-md-inline-code']],
+    div: [...(defaultSchema.attributes?.div ?? []), ['className', 'gpt-md-layout-scroll', ...presentationClasses], ['role', 'img'], 'ariaLabel', 'dataGptMdRatio', 'dataGptMdBarColor', 'dataGptMdBarHeight'],
+    span: [...(defaultSchema.attributes?.span ?? []), ['className', ...presentationClasses]],
+    table: [...(defaultSchema.attributes?.table ?? []), ['className', 'gpt-md-layout', 'gpt-md-plain-row', 'gpt-md-meter-row']],
+    td: [...(defaultSchema.attributes?.td ?? []), 'colSpan', 'rowSpan', 'width', ['className', 'gpt-md-card', 'gpt-md-connector', 'gpt-md-highlight', 'gpt-md-plain-cell']],
     th: [...(defaultSchema.attributes?.th ?? []), 'colSpan', 'rowSpan', ['scope', 'row', 'col', 'rowgroup', 'colgroup']],
   },
   protocols: {
@@ -41,7 +45,7 @@ const previewSchema: SanitizeOptions = {
   },
 };
 
-function text(value: string): RootContent {
+function text(value: string): Text {
   return { type: 'text', value };
 }
 
@@ -125,6 +129,27 @@ const hardenResources: Plugin<[{ diagnostics: Diagnostic[]; imageAssets?: Record
 
         if (Array.isArray(node.properties.className) && !node.properties.className.length) delete node.properties.className;
 
+        if (node.tagName === 'td' && node.properties.width !== undefined) {
+          const width = Number(node.properties.width);
+          if (!Number.isInteger(width) || width < 1 || width > 256) delete node.properties.width;
+        }
+        if (node.tagName === 'div' && Array.isArray(node.properties.className) && node.properties.className.includes('gpt-md-meter')) {
+          const ratio = Number(node.properties.dataGptMdRatio), height = Number(node.properties.dataGptMdBarHeight);
+          const color = String(node.properties.dataGptMdBarColor || '');
+          if (node.properties.dataGptMdRatio === undefined || !Number.isFinite(ratio) || ratio < 0 || ratio > 100
+            || !Number.isFinite(height) || height <= 0 || height > 64 || !/^[\da-f]{6}$/i.test(color)) {
+            children[index] = element('span', [text('［比例图形参数不可用；请核对原页］')]);
+            diagnostics.push({ code: 'bar-preview-rejected', severity: 'warning', message: '有比例图形的参数未通过校验，已保留位置说明。' });
+            continue;
+          }
+          // CSS is stripped above. Rebuild numeric geometry and one opaque
+          // hex color, including the complete fill subtree, after validation.
+          node.properties.style = `height:${height}px`;
+          node.properties.role = 'img'; node.properties.ariaLabel = `比例条：${ratio}%`;
+          node.children = [element('span', [], { className: ['gpt-md-meter-fill'], style: `width:${ratio}%;background:#${color}` })];
+          continue;
+        }
+
         if (node.tagName === 'img') {
           const saved = typeof node.properties.src === 'string' ? imageAssets?.[node.properties.src] : undefined;
           if (saved && /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(saved)) {
@@ -164,6 +189,20 @@ const hardenResources: Plugin<[{ diagnostics: Diagnostic[]; imageAssets?: Record
 
         if (node.tagName === 'code') {
           const classes = Array.isArray(node.properties.className) ? node.properties.className : [];
+          if (classes.includes('gpt-md-inline-code')) {
+            // GFM can autolink a URL even inside an inline raw HTML code atom.
+            // Restore the exact literal text and discard that incidental tree.
+            node.children = [text(plainText(node))];
+            continue;
+          }
+          // A fence's language name is not evidence that its contents are a
+          // formula. KaTeX also accepts language-math, so isolate literal code
+          // until that pass finishes; genuine math carries an explicit mode.
+          if (classes.includes('language-math') && !classes.some(value => value === 'math-inline' || value === 'math-display')) {
+            node.data ??= {};
+            node.data.gptMdLiteralMath = true;
+            node.properties.className = classes.map(value => value === 'language-math' ? 'language-math-source' : value);
+          }
           if (classes.some((value) => value === 'math-inline' || value === 'math-display')
             && plainText(node).length > MAX_FORMULA_CHARACTERS) {
             node.properties.className = ['language-text'];
@@ -184,10 +223,23 @@ const hardenResources: Plugin<[{ diagnostics: Diagnostic[]; imageAssets?: Record
   };
 };
 
+const restoreLiteralCodeLanguages: Plugin<[], Root> = () => tree => {
+  const walk = (parent: Root | Element): void => {
+    for (const node of parent.children) {
+      if (node.type !== 'element') continue;
+      if (node.tagName === 'code' && node.data?.gptMdLiteralMath && Array.isArray(node.properties.className)) {
+        node.properties.className = node.properties.className.map(value => value === 'language-math-source' ? 'language-math' : value);
+      }
+      walk(node);
+    }
+  };
+  walk(tree);
+};
+
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[character]!);
+  })[character]!).replace(/\r/g, '&#13;');
 }
 
 /** Render exactly the serialized Markdown. This function never reads page DOM. */
@@ -216,6 +268,7 @@ export async function renderPreview(markdown: string, options: PreviewOptions = 
       .use(rehypeKatex, {
         output: 'htmlAndMathml', trust: false, strict: 'ignore', maxExpand: 1_000, maxSize: 30,
       })
+      .use(restoreLiteralCodeLanguages)
       .use(rehypeStringify)
       .process(markdown);
 
@@ -228,7 +281,9 @@ export async function renderPreview(markdown: string, options: PreviewOptions = 
           : `预览提示：${message.reason}`,
       });
     }
-    return { html: String(file), diagnostics };
+    // HTML insertion normalizes literal CR to LF. Character references keep
+    // a source CR intact, including CRLF in literal code, through that step.
+    return { html: String(file).replace(/\r/g, '&#13;'), diagnostics };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     return {

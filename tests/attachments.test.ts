@@ -31,11 +31,11 @@ test('account attribution and explicit excluded controls do not become answer co
 test('a bordered D card retains its grouping and separate caption without copying page markup', async () => {
   const result = capture('<div data-d-component="box" data-d-has-border><div data-d-component="row"><div data-d-component="box"><p data-d-component="text">Research file</p><p data-d-component="text">HTML document</p></div></div><p data-d-component="text">A short description.</p><span data-d-component="caption">File: <code data-d-component="code">sample.html</code></span></div>');
   const ast = parsed(result.markdown);
-  assert.equal(find(ast, 'blockquote').length, 1);
-  assert.equal(find(ast, 'paragraph').length, 4);
-  assert.doesNotMatch(result.markdown, /data-d-component|class=|style=/);
+  assert.equal(find(ast, 'blockquote').length, 0, 'a visual card is not quoted prose');
+  assert.match(result.markdown, /gpt-md-group gpt-md-bordered/);
+  assert.doesNotMatch(result.markdown, /data-d-component|oIb9lq/);
   const preview = new JSDOM((await renderPreview(result.markdown)).html);
-  try { assert.equal(preview.window.document.querySelectorAll('blockquote p').length, 4); }
+  try { assert.equal(preview.window.document.querySelectorAll('.gpt-md-bordered p').length, 4); }
   finally { preview.window.close(); }
 });
 

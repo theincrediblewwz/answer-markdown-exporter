@@ -1,5 +1,5 @@
 /** Copy only document layout facts to an export clone, never page CSS or URLs. */
-const properties = ['display', 'visibility', 'flex-direction', 'grid-template-columns', 'grid-row-start', 'grid-row-end', 'grid-column-start', 'grid-column-end', 'white-space', 'order', 'background-color'] as const;
+const properties = ['display', 'visibility', 'flex-direction', 'grid-template-columns', 'grid-row-start', 'grid-row-end', 'grid-column-start', 'grid-column-end', 'white-space', 'order', 'background-color', 'text-align', 'align-items', 'justify-content', 'flex-wrap', 'gap', 'width', 'height', 'border-top-width', 'border-top-style', 'border-radius', 'font-size', 'font-weight', 'color'] as const;
 export function annotateLayout(source: Element, clone: Element): void {
   const view = source.ownerDocument.defaultView;
   if (!view) return;
@@ -7,12 +7,14 @@ export function annotateLayout(source: Element, clone: Element): void {
   let visited = 0;
   while (stack.length && ++visited <= 8_000) {
     const [original, copy] = stack.pop()!;
-    if (original.tagName !== copy.tagName || original.matches('pre,code,math,.katex,[data-code-block],.cm-editor,[data-gpt-md-ui]')) continue;
+    if (original.tagName !== copy.tagName || original.matches('math,.katex,[data-gpt-md-ui]')) continue;
+    const codeScope = !!original.closest('pre,code,[data-code-block],[data-code-block-source],[data-d-component="code_block"],.cm-editor,.cm-content');
     // Clear page-provided copies of these facts before reading the live element.
     for (const name of properties) copy.removeAttribute('data-gpt-md-' + name);
-    if (original.matches('div,section,article,main,aside,p,span,li,dl,dt,dd,table,thead,tbody,tfoot,tr,th,td,svg,img,canvas,[data-d-component="row"],[data-d-component="box"]')) {
+    if (codeScope || original.matches('div,section,article,main,aside,p,span,li,dl,dt,dd,table,thead,tbody,tfoot,tr,th,td,svg,img,canvas,[data-d-component="row"],[data-d-component="box"]')) {
       const style = view.getComputedStyle(original);
       for (const name of properties) {
+        if (codeScope && !['display', 'visibility', 'white-space'].includes(name)) continue;
         const value = style.getPropertyValue(name);
         if (value && value.length <= 512) copy.setAttribute('data-gpt-md-' + name, value);
       }

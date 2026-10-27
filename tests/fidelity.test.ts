@@ -248,13 +248,22 @@ test('task lists inside complex HTML tables retain checked and unchecked states'
   }
 });
 
-test('literal BR line breaks in code retain indentation and blank lines', () => {
+test('literal BR line breaks preserve block code and retain multiline inline code inside its paragraph', async () => {
   const source = 'def sample():\n    value = 1\n\n    return value\n';
   const result = extractMarkdown(root('<pre><code class="language-python"><span>def sample():</span><br>    value = 1<br><br>    return value<br></code></pre>'));
   assert.deepEqual(result.codeBlocks, [{ text: source, language: 'python' }]);
   assert.equal(find(tree(result.markdown), 'code')[0].value, source);
-  const inline = extractMarkdown(root('<p><code>first<br>  second</code></p>'));
-  assert.equal(find(tree(inline.markdown), 'code')[0].value, 'first\n  second');
+  const inline = extractMarkdown(root('<p>Before <code>first<br>  second</code> after.</p>'));
+  assert.deepEqual(inline.codeBlocks, []);
+  assert.equal(find(tree(inline.markdown), 'code').length, 0, 'line breaks cannot promote a paragraph child into a separate block');
+  const preview = await renderPreview(inline.markdown);
+  const page = new JSDOM(preview.html);
+  try {
+    assert.equal(page.window.document.querySelectorAll('p').length, 1);
+    assert.equal(page.window.document.querySelector('p > code')?.textContent, 'first\n  second');
+    assert.equal(page.window.document.querySelector('p')?.textContent, 'Before first\n  second after.');
+    assert.equal(page.window.document.querySelectorAll('pre').length, 0);
+  } finally { page.window.close(); }
   assert.ok(inline.diagnostics.some(note => note.code === 'MULTILINE_INLINE_CODE'));
 });
 

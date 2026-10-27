@@ -1,6 +1,8 @@
 import { answerBodyElements, UI_ATTRIBUTE } from './adapter';
+import { codeBlockSelector, ownedCodeElements, ownedCodeSource, rememberCodeSourcePlacement } from './code-dom';
+import { annotateLayout } from './layout';
 
-const BLOCK_SELECTOR = '[data-code-block="true"][data-markdown-copy="code-block"]';
+const BLOCK_SELECTOR = codeBlockSelector;
 const OMIT_SELECTOR = `[${UI_ATTRIBUTE}],[data-gpt-md-ignore],[hidden],[inert],[aria-hidden="true"],[data-markdown-copy="exclude"],[data-message-channel="analysis"],[data-message-channel="commentary"],[data-message-type="reasoning"],[data-testid="thinking"],[data-testid="reasoning"]`;
 const MAX_BLOCKS = 100;
 const MAX_CHARACTERS = 2_000_000;
@@ -18,7 +20,7 @@ function visible(block: Element): boolean {
 }
 
 function source(block: Element): Element | undefined {
-  return Array.from(block.children).find(child => child.matches('[data-code-block-source="true"]') && child.querySelector('code'));
+  return ownedCodeSource(block);
 }
 
 async function settle(view: Window | null, deadline: number, current: () => boolean): Promise<void> {
@@ -73,13 +75,17 @@ export async function captureCodeSources(answers: Element[], current: () => bool
   const capture = (block: Element): boolean => {
     if (snapshots.has(block)) return true;
     const mounted = source(block);
-    const code = mounted?.querySelector('code');
-    if (!active() || !visible(block) || !mounted || !visible(mounted) || !code || !visible(code)) return false;
+    const codes = mounted ? ownedCodeElements(mounted) : [];
+    if (!active() || !visible(block) || !mounted || !visible(mounted) || (codes.length && !codes.some(visible))) return false;
     const available = MAX_CHARACTERS - characters;
     if ((block.textContent?.length || 0) > available) return false;
-    const size = block.outerHTML.length;
+    if (block.outerHTML.length > available) return false;
+    const snapshot = block.cloneNode(true) as Element;
+    annotateLayout(block, snapshot);
+    const size = snapshot.outerHTML.length;
     if (size > available) return false;
-    snapshots.set(block, block.cloneNode(true) as Element);
+    rememberCodeSourcePlacement(snapshot, block, mounted);
+    snapshots.set(block, snapshot);
     characters += size;
     return true;
   };
