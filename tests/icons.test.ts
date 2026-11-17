@@ -51,8 +51,8 @@ test('overlong and excessively nested geometry are rejected before rasterization
   assert.throws(() => sanitizedIconSvg(excessive.querySelector('svg')!), /非几何/);
 });
 
-test('cloned standalone SVG icons become 20px local PNGs without changing the live page', async () => {
-  const document = documentFor(svg('<title>Network</title><path d="M0 0L7 7"/>', 'data-d-component="icon" fill="currentColor"'));
+test('icons explicitly included as figure content keep their image geometry without changing the live page', async () => {
+  const document = documentFor('<figure>' + svg('<title>Network</title><path d="M0 0L7 7"/>', 'data-d-component="icon" fill="currentColor"') + '</figure>');
   const live = document.querySelector('main')!;
   const clone = live.cloneNode(true) as Element;
   const runtime = fakeRaster(document);
@@ -70,7 +70,7 @@ test('cloned standalone SVG icons become 20px local PNGs without changing the li
 
 test('decorative link icons are excluded, and equivalent independent icons share one raster result', async () => {
   const shape = svg('<path d="M0 0L8 8"/>');
-  const document = documentFor(`<span data-d-component="icon" aria-label="Map">${shape}</span><span data-d-component="icon">${shape}</span><span data-d-component="pressable" role="link"><span data-d-component="icon">${shape}</span></span>`);
+  const document = documentFor(`<figure><span data-d-component="icon" aria-label="Map">${shape}</span><span data-d-component="icon">${shape}</span></figure><span data-d-component="pressable" role="link"><span data-d-component="icon">${shape}</span></span>`);
   const runtime = fakeRaster(document);
   const result = await prepareIconImages(document.querySelector('main')!);
   assert.equal(document.querySelectorAll('img[data-gpt-md-icon-image]').length, 2);
@@ -81,7 +81,7 @@ test('decorative link icons are excluded, and equivalent independent icons share
 });
 
 test('conversion failure keeps the source icon and records a warning', async () => {
-  const document = documentFor(`<span data-d-component="icon">${svg('<path d="M0 0L9 9"/>')}</span>`);
+  const document = documentFor(`<figure><span data-d-component="icon">${svg('<path d="M0 0L9 9"/>')}</span></figure>`);
   const runtime = fakeRaster(document, async () => { throw new Error('Synthetic decode failure'); });
   const result = await prepareIconImages(document.querySelector('main')!);
   assert.equal(document.querySelectorAll('svg').length, 1); assert.equal(document.querySelectorAll('img').length, 0);
@@ -90,7 +90,7 @@ test('conversion failure keeps the source icon and records a warning', async () 
 });
 
 test('cancellation during image decoding leaves the clone unchanged and releases the local Blob', async () => {
-  const document = documentFor(`<span data-d-component="icon">${svg('<path d="M0 0L10 10"/>')}</span>`);
+  const document = documentFor(`<figure><span data-d-component="icon">${svg('<path d="M0 0L10 10"/>')}</span></figure>`);
   const runtime = fakeRaster(document, () => new Promise(() => {}));
   const controller = new AbortController();
   const pending = prepareIconImages(document.querySelector('main')!, { signal: controller.signal });
@@ -101,7 +101,7 @@ test('cancellation during image decoding leaves the clone unchanged and releases
 
 test('icon decoding has a bounded two-second timeout', async context => {
   context.mock.timers.enable({ apis: ['setTimeout'] });
-  const document = documentFor(`<span data-d-component="icon">${svg('<path d="M0 0L11 11"/>')}</span>`);
+  const document = documentFor(`<figure><span data-d-component="icon">${svg('<path d="M0 0L11 11"/>')}</span></figure>`);
   const runtime = fakeRaster(document, () => new Promise(() => {}));
   const pending = prepareIconImages(document.querySelector('main')!);
   context.mock.timers.tick(2_000);
@@ -113,7 +113,7 @@ test('icon decoding has a bounded two-second timeout', async context => {
 
 test('the entire icon conversion pass stops after six seconds', async context => {
   context.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  const document = documentFor(Array.from({ length: 4 }, (_, index) => `<span data-d-component="icon">${svg(`<path d="M0 0L${index + 200} 19"/>`)}</span>`).join(''));
+  const document = documentFor('<figure>' + Array.from({ length: 4 }, (_, index) => `<span data-d-component="icon">${svg(`<path d="M0 0L${index + 200} 19"/>`)}</span>`).join('') + '</figure>');
   const runtime = fakeRaster(document, () => new Promise(() => {}));
   const pending = prepareIconImages(document.querySelector('main')!);
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -128,7 +128,7 @@ test('the entire icon conversion pass stops after six seconds', async context =>
 });
 
 test('no more than forty icons are processed in one export', async () => {
-  const document = documentFor(Array.from({ length: 41 }, (_, index) => `<span data-d-component="icon">${svg(`<path d="M0 0L${index + 100} 12"/>`)}</span>`).join(''));
+  const document = documentFor('<figure>' + Array.from({ length: 41 }, (_, index) => `<span data-d-component="icon">${svg(`<path d="M0 0L${index + 100} 12"/>`)}</span>`).join('') + '</figure>');
   const runtime = fakeRaster(document);
   const result = await prepareIconImages(document.querySelector('main')!);
   assert.equal(document.querySelectorAll('img').length, 40); assert.equal(document.querySelectorAll('svg').length, 1);

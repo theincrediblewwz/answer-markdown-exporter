@@ -5,6 +5,7 @@ import printCss from './print.css';
 import mathCss from 'katex/dist/katex.min.css';
 import documentCss from './document.css';
 import { appearanceControls, appearanceCss, applyAppearance, normalizeAppearance } from './appearance';
+import { cleanDocumentTitle, suggestDocumentTitle } from './document-title';
 
 const tokenPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const rasterPattern = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
@@ -29,8 +30,11 @@ function waitAtMost(promise: Promise<unknown>, milliseconds: number): Promise<bo
 }
 
 async function initializePrintPage(): Promise<void> {
-  styles(); document.title = '回答导出 PDF';
+  styles(); document.title = suggestDocumentTitle(document.createDocumentFragment());
   const tools = node('header');tools.id = 'print-tools';tools.append(node('h1', 'PDF 预览'));
+  const nameLabel = node('label', '文件名'); nameLabel.className = 'print-name';
+  const filename = node('input'); filename.type = 'text'; filename.disabled = true; filename.maxLength = 160; filename.setAttribute('aria-label', 'PDF 文件名');
+  filename.title = '可修改保存时建议的文件名，不需要填写 .pdf'; nameLabel.append(filename); tools.append(nameLabel);
   const printButton = node('button', '打印／另存为 PDF');printButton.type = 'button';printButton.disabled = true;tools.append(printButton);
   const status = node('p', '正在准备打印内容…');status.id = 'print-status';status.setAttribute('role', 'status');
   const notes = node('details');notes.id = 'print-diagnostics';notes.hidden = true;notes.append(node('summary', '导出说明'));const noteList = node('ul');notes.append(noteList);
@@ -61,7 +65,11 @@ async function initializePrintPage(): Promise<void> {
     content.append(template.content);
     addNotes([...(payload.diagnostics || []), ...rendered.diagnostics]);
     if (blockedImages) addNotes([{ code: 'print-image-unavailable', severity: 'warning', message: `${blockedImages} 张图片未取得已验证的本地资源，打印中保留占位说明。` }]);
-    const heading = content.querySelector('h1')?.textContent?.trim();if (heading) document.title = heading.slice(0, 80) + ' - PDF';
+    const suggested = suggestDocumentTitle(content);
+    filename.value = suggested; filename.disabled = false; document.title = suggested;
+    const updateName = () => { const title = cleanDocumentTitle(filename.value) || suggested; document.title = title; return title; };
+    filename.addEventListener('input', updateName);
+    filename.addEventListener('change', () => { filename.value = updateName(); });
     void content.getBoundingClientRect();
     const fontsReady = !document.fonts || await waitAtMost(document.fonts.ready, 8000);
     if (!fontsReady) addNotes([{ code: 'print-font-timeout', severity: 'warning', message: '部分字体未在等待时间内准备好，可稍后再次打印。' }]);

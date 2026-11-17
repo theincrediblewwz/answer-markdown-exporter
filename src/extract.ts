@@ -472,6 +472,8 @@ class Capture {
       return children;
     }
     if (component === 'icon') {
+      const symbol = element.getAttribute('data-gpt-md-icon-text');
+      if (symbol?.trim() && symbol.length <= 160) return [text(symbol)];
       const raster = element.querySelector('img[data-gpt-md-icon-image]');
       const source = raster?.getAttribute('src') || '';
       if (/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(source)) {

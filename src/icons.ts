@@ -1,8 +1,10 @@
 import type { Diagnostic } from './types';
 import { excludedContent } from './content-policy';
+import { iconSymbol } from './icon-symbols';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const MAX_ICONS = 40;
+const MAX_TEXT_ICONS = 500;
 const MAX_SVG_CHARACTERS = 20_000;
 const geometry: Record<string, Set<string>> = {
   svg: new Set(['viewBox', 'width', 'height']), g: new Set(), path: new Set(['d']),
@@ -121,15 +123,28 @@ async function rasterize(svg: string, document: Document, timeout: number, signa
 export async function prepareIconImages(root: Element, options: { signal?: AbortSignal; current?: () => boolean } = {}): Promise<Diagnostic[]> {
   const diagnostics: Diagnostic[] = [];
   const icons = [...root.querySelectorAll('[data-d-component="icon"]')]
-    .filter(icon => !excludedContent(icon) && !icon.closest('pre,code,[data-d-component="pressable"][role="link"]') && (icon.localName === 'svg' || icon.querySelector('svg')));
+    .filter(icon => !excludedContent(icon) && !icon.closest('pre,code,math,.katex,[data-d-component="pressable"][role="link"]')
+      && !icon.parentElement?.closest('svg,[data-d-component="icon"]') && (icon.localName === 'svg' || icon.querySelector('svg')));
   const deadline = Date.now() + 6_000;
-  let converted = 0; let failed = 0;
-  for (const icon of icons.slice(0, MAX_ICONS)) {
+  let converted = 0; let textual = 0; let neutral = 0; let failed = 0;
+  for (const icon of icons.slice(0, MAX_TEXT_ICONS)) {
     if (options.signal?.aborted || options.current?.() === false) break;
     if (Date.now() >= deadline) { failed += 1; break; }
     try {
       const source = icon.localName === 'svg' ? icon : icon.querySelector('svg')!;
       const svg = sanitizedIconSvg(source);
+      const explicitContent = !!icon.closest('figure,picture,[data-d-component="image"],[data-message-image="original"],[data-gpt-md-diagram-image]')
+        || ['width', 'height'].some(axis => /^(?:\d+(?:\.\d+)?)(?:px)?$/.test(source.getAttribute(axis) || '') && parseFloat(source.getAttribute(axis)!) > 64);
+      if (!explicitContent) {
+        const label = (icon.getAttribute('aria-label') || source.getAttribute('aria-label') || source.querySelector('title')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+        const symbol = iconSymbol(source, icon);
+        const value = symbol || (label && !/^(?:icon|图标)$/i.test(label) ? `[${label}]` : '◇');
+        const replacement = root.ownerDocument.createElement('span'); replacement.setAttribute('data-d-component', 'icon');
+        replacement.setAttribute('data-gpt-md-icon-text', value); replacement.textContent = value;
+        icon.replaceWith(replacement); textual++; if (!symbol && value === '◇') neutral++;
+        continue;
+      }
+      if (converted >= MAX_ICONS) { failed++; continue; }
       let png = pngCache.get(svg);
       if (!png) {
         png = await rasterize(svg, root.ownerDocument, Math.min(2_000, deadline - Date.now()), options.signal);
@@ -148,6 +163,8 @@ export async function prepareIconImages(root: Element, options: { signal?: Abort
     } catch { failed += 1; }
   }
   if (converted) diagnostics.push({ code: 'ICONS_AS_IMAGES', severity: 'info', message: `${converted} 个图标已独立转换为本地 PNG，图片包内保留图标文件。` });
-  if (failed || icons.length > MAX_ICONS) diagnostics.push({ code: 'ICON_CONVERSION_INCOMPLETE', severity: 'warning', message: '部分图标未能转换为图片（不支持的内容、数量或时间限制），已保留其可确认的文字标注或位置。' });
+  if (textual) diagnostics.push({ code: 'ICONS_AS_TEXT', severity: 'info', message: `${textual} 个界面图标已用文字符号或标签保留，不生成图片文件。` });
+  if (neutral) diagnostics.push({ code: 'ICON_NEUTRAL_TEXT', severity: 'info', message: `${neutral} 个没有文字标注的界面图标已用中性符号 ◇ 保留位置，未猜测其形状或含义。` });
+  if (failed || icons.length > MAX_TEXT_ICONS) diagnostics.push({ code: 'ICON_CONVERSION_INCOMPLETE', severity: 'warning', message: '部分图标未能完整转换（格式、数量或时间限制），已保留其可确认的文字标注或位置。' });
   return diagnostics;
 }

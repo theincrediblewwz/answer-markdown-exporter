@@ -213,6 +213,23 @@ test('print typography can be adjusted without rewriting the Markdown or its cod
   });
 });
 
+test('PDFs without h1 use lower headings or prose and allow a safe user-supplied name', async () => {
+  for (const html of ['<h2>长对话导出验证</h2><p>Body</p>', '<p>长对话导出验证</p>']) {
+    await withPrintPage({ html }, async (page, state) => {
+      await eventually(() => state.prints === 1);
+      assert.equal(page.window.document.title, '长对话导出验证');
+      const name = page.window.document.querySelector<HTMLInputElement>('[aria-label="PDF 文件名"]')!;
+      assert.equal(name.value, '长对话导出验证');
+      name.value = '我的对比：A/B.pdf'; name.dispatchEvent(new page.window.Event('input'));
+      assert.equal(page.window.document.title, '我的对比：A B');
+      name.dispatchEvent(new page.window.Event('change'));
+      assert.equal(name.value, '我的对比：A B');
+      name.value = ''; name.dispatchEvent(new page.window.Event('change'));
+      assert.equal(name.value, '长对话导出验证');
+    });
+  }
+});
+
 test('print page renders final Markdown with its assets, keeps table/code structure and auto-prints once', async () => {
   const payload: PrintPayload = { markdown: '# Exact source\n\n    keep indentation\n', imageAssets: { 'images/a.png': image }, diagnostics: [{ code: 'note', severity: 'info', message: 'Export note' }] };
   await withPrintPage({ payload }, async (page, state) => {
