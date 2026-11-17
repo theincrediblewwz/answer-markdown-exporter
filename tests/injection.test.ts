@@ -82,6 +82,15 @@ async function withController(
 
 const source = await bundledContent;
 
+function selectControl(page: JSDOM, index = 0): void {
+  const checkbox = controls(page)[index].shadowRoot!.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+  checkbox.checked = true; checkbox.dispatchEvent(new page.window.Event('change'));
+}
+function trayAction(page: JSDOM, name: string): HTMLButtonElement {
+  const tray = page.window.document.querySelector('[data-gpt-md-ui="selection"]')!;
+  return [...tray.shadowRoot!.querySelectorAll<HTMLButtonElement>('button')].find(action => action.textContent === name)!;
+}
+
 function controls(page: JSDOM): HTMLElement[] {
   return Array.from(page.window.document.querySelectorAll<HTMLElement>('[data-gpt-md-ui="controls"]'));
 }
@@ -125,6 +134,105 @@ test('a role added after initialization discovers an existing completed answer',
     page.window.document.querySelector('#answer')!.setAttribute('data-message-author-role', 'assistant');
     await eventually(() => controls(page).length === 1, assertHealthy, 'adding only the assistant role must create export controls');
     assertOneButtonGroup(page);
+  });
+});
+
+test('selected snapshots survive virtualization and remounts while preserving conversation order and code', async () => {
+  const requests: Array<{ markdown: string }> = [];
+  await withController('<main><article data-testid="conversation-turn-80"><div data-message-author-role="assistant" data-message-id="m80"><p>Middle answer</p></div></article><article data-testid="conversation-turn-90"><div data-message-author-role="assistant" data-message-id="m90"><p>Last answer</p><pre><code class="language-python">if ready:\n    keep_indent()\n</code></pre></div></article></main>', async (page, healthy) => {
+    selectControl(page, 1);
+    page.window.document.querySelector('[data-testid="conversation-turn-90"]')!.remove();
+    await settle(page);
+    assert.match(page.window.document.querySelector('[data-gpt-md-ui="selection"]')!.shadowRoot!.textContent || '', /已选 1 条/);
+    assert.ok(trayAction(page, '导出 PDF'));
+    page.window.document.querySelector('main')!.insertAdjacentHTML('afterbegin', '<article data-testid="conversation-turn-10"><div data-message-author-role="assistant" data-message-id="m10"><p>Earlier answer</p></div></article>');
+    page.window.document.querySelector('main')!.insertAdjacentHTML('beforeend', '<article data-testid="conversation-turn-90"><div data-message-author-role="assistant" data-message-id="m90"><p>New remount text</p></div></article>');
+    await settle(page);
+    const remounted = controls(page).find(host => host.previousElementSibling?.getAttribute('data-message-id') === 'm90')!;
+    assert.equal(remounted.shadowRoot!.querySelector<HTMLInputElement>('input')!.checked, true);
+    selectControl(page, 0);
+    trayAction(page, '导出 PDF').click();
+    await eventually(() => requests.length === 1, healthy, 'detached selected answers must still export');
+    const markdown = requests[0].markdown;
+    assert.ok(markdown.indexOf('Earlier answer') < markdown.indexOf('Last answer'));
+    assert.match(markdown, /if ready:\n    keep_indent\(\)/);
+    assert.doesNotMatch(markdown, /Middle answer|New remount text/);
+  }, document => {
+    const runtime = (document.defaultView as unknown as { chrome: { runtime: { sendMessage: (message: unknown) => Promise<unknown> } } }).chrome.runtime;
+    runtime.sendMessage = async message => { requests.push(message as { markdown: string }); return { ok: true }; };
+  });
+});
+
+test('virtualizing a selected answer during image preparation keeps the frozen export valid', async () => {
+  let finishImage: (value: Response) => void = () => {};
+  let requests = 0, fetches = 0;
+  const delayed = new Promise<Response>(resolve => { finishImage = resolve; });
+  await withController('<main><div data-message-id="frozen" data-message-author-role="assistant"><p>Frozen with image</p><img src="https://images.example.test/plot.png" alt="Plot"></div></main>', async (page, healthy) => {
+    selectControl(page); trayAction(page, '导出 PDF').click();
+    await eventually(() => fetches === 1, healthy, 'the image must be prepared only by the export action');
+    page.window.document.querySelector('[data-message-id="frozen"]')!.remove();
+    await settle(page);
+    finishImage(new Response(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64'), { headers: { 'content-type': 'image/png' } }));
+    await eventually(() => requests === 1, healthy, 'unmounting may not cancel a frozen export');
+  }, document => {
+    Object.defineProperty(document.defaultView!, 'fetch', { value: () => { fetches++; return delayed; } });
+    const runtime = (document.defaultView as unknown as { chrome: { runtime: { sendMessage: (message: unknown) => Promise<unknown> } } }).chrome.runtime;
+    runtime.sendMessage = async () => { requests++; return { ok: true }; };
+  });
+});
+
+test('selection survives fragment scrolling but clears on navigation and when explicitly cleared', async () => {
+  await withController('<main><div data-message-id="m1" data-message-author-role="assistant">Keep selected</div></main>', async (page) => {
+    selectControl(page);
+    page.window.history.replaceState({}, '', '#earlier-message'); page.window.dispatchEvent(new page.window.PopStateEvent('popstate'));
+    await settle(page); assert.ok(trayAction(page, '下载 Markdown'));
+    trayAction(page, '清空选择').click(); assert.equal(page.window.document.querySelector('[data-gpt-md-ui="selection"]'), null);
+    selectControl(page); page.window.history.pushState({}, '', '/c/another-conversation'); page.window.dispatchEvent(new page.window.PopStateEvent('popstate'));
+    await settle(page); assert.equal(page.window.document.querySelector('[data-gpt-md-ui="selection"]'), null);
+    assert.equal(controls(page)[0].shadowRoot!.querySelector<HTMLInputElement>('input')!.checked, false);
+  });
+});
+
+test('preview typography is remembered locally without storing answer content or changing exported Markdown', async () => {
+  let copied = '';
+  await withController('<main><div data-message-author-role="assistant"><p>private-font-fixture</p></div></main>', async (page, healthy) => {
+    buttons(page).find(action => action.textContent === '预览')!.click();
+    await eventually(() => !!page.window.document.querySelector('[data-gpt-md-ui="preview"]')?.shadowRoot?.querySelector('.document'), healthy, 'the preview must render');
+    let root = page.window.document.querySelector('[data-gpt-md-ui="preview"]')!.shadowRoot!;
+    const size = root.querySelector<HTMLInputElement>('[aria-label="正文字号"]')!; size.value = '24'; size.dispatchEvent(new page.window.Event('change'));
+    const width = root.querySelector<HTMLSelectElement>('[aria-label="阅读宽度"]')!; width.value = '640'; width.dispatchEvent(new page.window.Event('change'));
+    assert.equal(root.querySelector<HTMLElement>('.document')!.style.fontSize, '24px');
+    assert.equal(root.querySelector<HTMLElement>('.document')!.style.maxWidth, '640px');
+    previewClose(page).click(); buttons(page).find(action => action.textContent === '预览')!.click();
+    await eventually(() => !!page.window.document.querySelector('[data-gpt-md-ui="preview"]')?.shadowRoot?.querySelector('.document'), healthy, 'the second preview must render');
+    root = page.window.document.querySelector('[data-gpt-md-ui="preview"]')!.shadowRoot!;
+    assert.equal(root.querySelector<HTMLInputElement>('[aria-label="正文字号"]')!.value, '24');
+    assert.doesNotMatch(page.window.localStorage.getItem('answer-markdown-exporter:appearance:v1')!, /private-font-fixture/);
+    assert.equal(page.window.localStorage.length, 1);
+    [...root.querySelectorAll<HTMLButtonElement>('button')].find(action => action.textContent === '复制')!.click();
+    await eventually(() => copied !== '', healthy, 'copy must still use the Markdown source');
+    assert.equal(copied, 'private-font-fixture\n');
+  }, document => {
+    mockDialogs(document);
+    Object.defineProperty(document.defaultView!.navigator, 'clipboard', { value: { writeText: async (value: string) => { copied = value; } } });
+  });
+});
+
+test('blocked local settings do not change the chosen font between preview and PDF', async () => {
+  const requests: Array<{ appearance: { fontSize: number } }> = [];
+  await withController('<main><div data-message-author-role="assistant"><p>Storage unavailable</p></div></main>', async (page, healthy) => {
+    buttons(page).find(action => action.textContent === '预览')!.click();
+    await eventually(() => !!page.window.document.querySelector('[data-gpt-md-ui="preview"]')?.shadowRoot?.querySelector('.document'), healthy, 'preview must work without storage');
+    const root = page.window.document.querySelector('[data-gpt-md-ui="preview"]')!.shadowRoot!;
+    const size = root.querySelector<HTMLInputElement>('[aria-label="正文字号"]')!; size.value = '26'; size.dispatchEvent(new page.window.Event('change'));
+    [...root.querySelectorAll<HTMLButtonElement>('button')].find(action => action.textContent === '导出 PDF')!.click();
+    await eventually(() => requests.length === 1, healthy, 'PDF must work without storage');
+    assert.equal(requests[0].appearance.fontSize, 26);
+  }, document => {
+    mockDialogs(document);
+    Object.defineProperty(document.defaultView!, 'localStorage', { get() { throw new Error('Storage blocked'); } });
+    const runtime = (document.defaultView as unknown as { chrome: { runtime: { sendMessage: (message: unknown) => Promise<unknown> } } }).chrome.runtime;
+    runtime.sendMessage = async message => { requests.push(message as { appearance: { fontSize: number } }); return { ok: true }; };
   });
 });
 

@@ -1,10 +1,12 @@
 import type { Diagnostic } from './types';
 import { IMAGE_LIMITS } from './limits';
+import { normalizeAppearance, type Appearance } from './appearance';
 
 export interface PrintPayload {
   markdown: string;
   imageAssets: Record<string, string>;
   diagnostics: Diagnostic[];
+  appearance?: Appearance;
 }
 
 export const PRINT_SESSION_LIFETIME_MS = 120_000;
@@ -77,7 +79,7 @@ function validatePayload(message: Record<string, unknown>): { payload: PrintPayl
     return { code: item.code, message: item.message, severity: item.severity };
   });
   const characters = message.markdown.length + imageCharacters + assetKeyCharacters + diagnostics.reduce((sum, item) => sum + item.code.length + item.message.length, 0);
-  return { payload: { markdown: message.markdown, imageAssets, diagnostics }, characters };
+  return { payload: { markdown: message.markdown, imageAssets, diagnostics, appearance: normalizeAppearance(message.appearance) }, characters };
 }
 
 /** In-memory broker: a worker restart deliberately discards all conversation data. */

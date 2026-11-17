@@ -4,6 +4,7 @@ import type { PrintPayload } from './background';
 import printCss from './print.css';
 import mathCss from 'katex/dist/katex.min.css';
 import documentCss from './document.css';
+import { appearanceControls, appearanceCss, applyAppearance, normalizeAppearance } from './appearance';
 
 const tokenPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const rasterPattern = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
@@ -17,7 +18,7 @@ function styles(): void {
     const name = value.replace(/["']/g, '').replace(/^fonts\//, '');
     return `url("${chrome.runtime.getURL('vendor/katex/fonts/' + name)}")`;
   });
-  style.textContent += '\n' + documentCss;
+  style.textContent += '\n' + documentCss + '\n' + appearanceCss;
   document.head.append(style);
 }
 function waitAtMost(promise: Promise<unknown>, milliseconds: number): Promise<boolean> {
@@ -41,6 +42,9 @@ async function initializePrintPage(): Promise<void> {
     const response = await chrome.runtime.sendMessage({ type: 'gpt-md:print-payload', token });
     if (!response?.ok || !response.payload || typeof response.payload.markdown !== 'string') throw new Error(response?.error || '未取得打印数据，请返回 GPT 再次打印。');
     const payload = response.payload as PrintPayload;
+    applyAppearance(content, normalizeAppearance(payload.appearance));
+    const appearance = appearanceControls(document, normalizeAppearance(payload.appearance), value => { applyAppearance(content, value); });
+    tools.insertAdjacentElement('afterend', appearance);
     const renderer = renderPreview as (markdown: string, options?: { imageAssets?: Record<string, string> }) => Promise<PreviewResult>;
     const rendered = await renderer(payload.markdown, { imageAssets: payload.imageAssets });
     // Keep detached markup inert until all image sources have been checked.

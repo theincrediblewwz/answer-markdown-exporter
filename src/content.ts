@@ -9,9 +9,14 @@ import { prepareIconImages } from './icons';
 import { prepareDiagramImages } from './diagrams';
 import { captureCodeSources } from './code-sources';
 import documentCss from './document.css';
+import { appearanceControls, appearanceCss, applyAppearance, readAppearance, saveAppearance } from './appearance';
+import { codeBlockSelector, ownedCodeSource } from './code-dom';
 
 type ReadyExport = ExportResult & { assets?: PreparedAssets };
-type ExportSnapshot = { answers: Element[]; changed: boolean };
+type ExportSnapshot = { answers: Element[]; changed: boolean; frozen: boolean };
+type SelectedAnswer = { id: string; source: Element; clone: Element; characters: number; pending: boolean; position: number | null };
+const SELECTION_LIMITS = { count: 50, characters: 8_000_000, answerCharacters: 2_000_000 };
+function pageRoute(): string { return location.origin + location.pathname + location.search; }
 
 const style = `:host{display:block!important;color-scheme:light dark;font:13px/1.5 system-ui,sans-serif;color:light-dark(#364152,#d0d7e2);width:100%;box-sizing:border-box}*{box-sizing:border-box}button{font:inherit;cursor:pointer;border:1px solid light-dark(#dbe0e7,#445064);border-radius:8px;background:light-dark(#fff,#202938);color:inherit;padding:6px 11px;transition:background .15s}button:hover{background:light-dark(#edf5f4,#293c40)}button:focus-visible{outline:2px solid #2b9a86;outline-offset:3px}button:disabled{opacity:.5;cursor:wait}.bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0 8px;padding-top:10px;border-top:1px solid light-dark(#e6e9ee,#354152)}.label{font-size:11px;letter-spacing:.06em;font-weight:650;color:light-dark(#417a70,#90c8b8);margin-right:3px}.status{font-size:12px;flex-basis:100%;min-height:0;color:light-dark(#667085,#a8b3c4)}.status:empty{display:none}dialog{padding:0;border:1px solid light-dark(#d9e1e6,#465266);border-radius:16px;width:min(1000px,94vw);max-height:90vh;color:light-dark(#253041,#e3e8ef);background:light-dark(#fff,#171e29);box-shadow:0 24px 80px #0005}dialog::backdrop{background:#0b16266b}.head{padding:18px 22px;border-bottom:1px solid light-dark(#e4e9ef,#354152);display:flex;align-items:center;justify-content:space-between;gap:15px}.title{font-size:18px;font-weight:650}.sub{font-size:12px;opacity:.7}.actions{display:flex;gap:8px;flex-wrap:wrap}.body{padding:20px 26px;overflow:auto;max-height:65vh;line-height:1.75;font-size:15px}.body h1,.body h2,.body h3{line-height:1.35}.body table{border-collapse:collapse;display:block;overflow:auto;max-width:100%;font-size:14px}.body td,.body th{padding:8px 12px;border:1px solid light-dark(#dce2e9,#485264);vertical-align:top}.body pre{white-space:pre;overflow:auto;background:light-dark(#f5f7fa,#0e1520);padding:16px;border-radius:9px;line-height:1.55}.body code{font-family:Consolas,monospace;font-size:.9em}.body p code{background:light-dark(#f0f3f7,#283242);padding:1px 4px;border-radius:4px}.body .katex-display{overflow-x:auto;overflow-y:hidden;padding:8px 0}.body a{color:light-dark(#087f72,#7ccebd)}.body blockquote{border-left:3px solid #57a696;margin:15px 0;padding:1px 18px}.body img{max-width:100%}.notes{padding:12px 22px;background:light-dark(#fff9e9,#352e20);font-size:12px;max-height:110px;overflow:auto}.notes:empty{display:none}textarea{width:100%;min-height:420px;resize:vertical;font:13px/1.65 Consolas,monospace;white-space:pre;padding:14px;color:inherit;background:light-dark(#f8fafc,#0e1520);border:1px solid #687585;border-radius:8px}.foot{font-size:11px;opacity:.65;padding:10px 22px;border-top:1px solid light-dark(#e4e9ef,#354152)}@media(max-width:600px){.head{align-items:flex-start;flex-direction:column}.body{padding:15px}.actions{gap:5px}button{padding:6px 8px}}@media(prefers-reduced-motion:reduce){button{transition:none}}`;
 
@@ -46,12 +51,19 @@ class ExportControls {
   private entries = new Map<Element, { host: HTMLElement; key: string; status: HTMLElement; buttons: HTMLButtonElement[] }>();
   private observer: MutationObserver;
   private raf = 0;
-  private url = location.href;
+  private url = pageRoute();
   private modalHost: HTMLElement | null = null;
   private closed = false;
   private generation = 0;
-  private selected = new Set<Element>();
+  private selected = new Map<string, SelectedAnswer>();
+  private anonymousKeys = new WeakMap<Element, string>();
+  private nextKey = 0;
+  private selectionVersion = 0;
+  private selectionOrder: string[] = [];
+  private selectionQueue: Promise<void> = Promise.resolve();
+  private appearance = readAppearance();
   private tray: HTMLElement | null = null;
+  private trayState: { label: HTMLElement; status: HTMLElement; actions: HTMLButtonElement[]; pending: boolean } | null = null;
   private lastError: string | null = null;
   private assetCache: { markdown: string; promise: Promise<PreparedAssets> } | null = null;
   private assetAbort = new AbortController();
@@ -76,6 +88,9 @@ class ExportControls {
       if (snapshot.changed) continue;
       snapshot.changed = relevant.some(change => {
         const element = change.target instanceof Element ? change.target : change.target.parentElement;
+        // A selected answer is already copied. Detachment and viewport recycling
+        // are harmless; generation-state changes still cancel an active action.
+        if (snapshot.frozen && (change.type !== 'attributes' || !['data-streaming', 'aria-busy', 'data-talvt-turn-state', 'data-message-complete', 'class'].includes(change.attributeName || ''))) return false;
         return snapshot.answers.some(answer => !!element && (answer === element || answer.contains(element)
           || (change.type === 'attributes' && element.contains(answer)))
           || [...change.removedNodes].some(removed => removed === answer || removed.contains(answer)));
@@ -83,11 +98,11 @@ class ExportControls {
     }
     if (relevant.length) this.schedule();
   }
-  private watchSnapshot(answers: Element[]): ExportSnapshot {
+  private watchSnapshot(answers: Element[], frozen = false): ExportSnapshot {
     // Lazy image preparation may legitimately mutate the live answer. Flush those
     // records before fixing the snapshot; later mutations invalidate only active exports.
     this.observeChanges(this.observer.takeRecords());
-    const snapshot = { answers, changed: false };this.snapshots.add(snapshot);return snapshot;
+    const snapshot = { answers, changed: false, frozen };this.snapshots.add(snapshot);return snapshot;
   }
   private snapshotCurrent(snapshot: ExportSnapshot | undefined): boolean {
     if (!snapshot) return true;
@@ -162,6 +177,9 @@ class ExportControls {
   }
   private async capture(answers: Element[], current: () => boolean, codeSources?: Map<Element, Element>): Promise<ExportResult[]> {
     const clones = answers.map(answer => cloneAnswerContent(answer, codeSources));
+    return this.renderClones(clones, current);
+  }
+  private async renderClones(clones: Element[], current: () => boolean): Promise<ExportResult[]> {
     const group = node('div'); group.append(...clones);
     const diagnostics = await prepareIconImages(group, { signal: this.assetAbort.signal, current });
     if (!current()) return [];
@@ -174,16 +192,25 @@ class ExportControls {
   }
   private async print(result: ReadyExport): Promise<void> {
     const imageAssets = Object.fromEntries(Object.entries(result.assets?.imageAssets || {}).filter(([key]) => key.startsWith('images/')));
-    const response = await chrome.runtime.sendMessage({ type: 'gpt-md:print-request', markdown: result.markdown, imageAssets, diagnostics: result.diagnostics });
+    const response = await chrome.runtime.sendMessage({ type: 'gpt-md:print-request', markdown: result.markdown, imageAssets, diagnostics: result.diagnostics, appearance: this.appearance });
     if (!response?.ok) throw new Error(response?.error || '无法准备 PDF，请重试。');
   }
   private scan(): void {
-    if (this.url !== location.href) { this.generation += 1; this.url = location.href; this.modalHost?.remove(); this.modalHost = null; this.assetAbort.abort(); this.assetAbort = new AbortController(); this.assetCache = null; this.clearSelection(); }
+    if (this.url !== pageRoute()) { this.generation += 1; this.url = pageRoute(); this.modalHost?.remove(); this.modalHost = null; this.assetAbort.abort(); this.assetAbort = new AbortController(); this.assetCache = null; this.clearSelection(); this.selectionOrder = []; }
     const answers = answerElements(); const state = generationState(answers);
     const ready = answers.filter(answer => !isGenerating(answer, state) && (answer.textContent?.trim() || answer.querySelector('img, math')));
+    // Insert newly mounted IDs beside known neighbours. Retain only identity,
+    // never the text of unselected historical answers.
+    const ids = ready.map(answer => this.selectionKey(answer));
+    for (let i = 0; i < ids.length; i++) {
+      if (this.selectionOrder.includes(ids[i])) continue;
+      const next = ids.slice(i + 1).find(id => this.selectionOrder.includes(id));
+      const before = next ? this.selectionOrder.indexOf(next) : i && this.selectionOrder.includes(ids[i - 1]) ? this.selectionOrder.indexOf(ids[i - 1]) + 1 : this.selectionOrder.length;
+      this.selectionOrder.splice(before, 0, ids[i]);
+    }
     const currentAnswers = new Set(ready);
     for (const [answer, entry] of this.entries) {
-      if (!currentAnswers.has(answer) || !entry.host.isConnected || entry.key !== answerKey(answer)) { entry.host.remove(); this.entries.delete(answer); if (this.selected.delete(answer)) this.updateTray(); }
+      if (!currentAnswers.has(answer) || !entry.host.isConnected || entry.key !== answerKey(answer)) { entry.host.remove(); this.entries.delete(answer); }
     }
     for (const answer of ready) {
       let entry = this.entries.get(answer);
@@ -196,9 +223,9 @@ class ExportControls {
         const run = async (kind: 'download' | 'copy' | 'preview' | 'pdf') => {
           if (this.pending.has(answer)) return;
           if (isGenerating(answer)) { status.textContent = '回答仍在生成，请完成后导出。'; return; }
-          const route = location.href; const key = answerKey(answer); const generation = this.generation;
+          const route = pageRoute(); const key = answerKey(answer); const generation = this.generation;
           let snapshot: ExportSnapshot | undefined;
-          const current = () => !this.closed && this.snapshotCurrent(snapshot) && answer.isConnected && host.isConnected && location.href === route && answerKey(answer) === key && this.generation === generation && !isGenerating(answer);
+          const current = () => !this.closed && this.snapshotCurrent(snapshot) && answer.isConnected && host.isConnected && pageRoute() === route && answerKey(answer) === key && this.generation === generation && !isGenerating(answer);
           this.pending.add(answer); buttons.forEach(button => { button.disabled = true; });
           try {
             await this.revealImages([answerContent(answer)], current, status); if (!current()) return;
@@ -226,7 +253,8 @@ class ExportControls {
         const buttons = [button('下载 Markdown', () => { void run('download'); }), button('复制', () => { void run('copy'); }), button('预览', () => { void run('preview'); }), button('导出 PDF', () => { void run('pdf'); })];
         const selectLabel = node('label'); selectLabel.style.cssText = 'margin-left:auto;display:flex;align-items:center;gap:5px;font-size:12px';
         const check = node('input'); check.type = 'checkbox'; check.setAttribute('aria-label', '选择这条回答');
-        check.addEventListener('change', () => { if (check.checked) this.selected.add(answer); else this.selected.delete(answer); this.updateTray(); });
+        check.checked = this.selected.has(this.selectionKey(answer));
+        check.addEventListener('change', () => { this.selectAnswer(answer, check, status); });
         selectLabel.append(check, node('span', '选择')); bar.append(...buttons, selectLabel, status); shadow.append(bar);
         answer.insertAdjacentElement('afterend', host);
         entry = { host, key: answerKey(answer), status, buttons }; this.entries.set(answer, entry);
@@ -235,39 +263,91 @@ class ExportControls {
       entry.buttons.forEach(b => { b.disabled = this.pending.has(answer); });
     }
   }
+  private selectionKey(answer: Element): string {
+    const key = answerKey(answer);
+    if (key) return `message:${key}`;
+    let anonymous = this.anonymousKeys.get(answer);
+    if (!anonymous) { anonymous = `local:${++this.nextKey}`; this.anonymousKeys.set(answer, anonymous); }
+    return anonymous;
+  }
+  private snapshotSize(clone: Element, replacing?: SelectedAnswer): number {
+    const characters = clone.outerHTML.length;
+    const used = [...this.selected.values()].reduce((sum, item) => sum + (item === replacing ? 0 : item.characters), 0);
+    if (characters > SELECTION_LIMITS.answerCharacters) throw new Error('这条回答超过临时快照上限，请使用回答下方的按钮单条导出。');
+    if (used + characters > SELECTION_LIMITS.characters) throw new Error('所选内容超过临时快照总量上限，请分批导出。');
+    return characters;
+  }
+  private selectAnswer(answer: Element, check: HTMLInputElement, status: HTMLElement): void {
+    const id = this.selectionKey(answer);
+    if (!check.checked) { this.selected.delete(id); this.selectionVersion++; this.updateTray(); return; }
+    if (this.selected.has(id)) return;
+    try {
+      if (this.selected.size >= SELECTION_LIMITS.count) throw new Error('一次最多选择 50 条回答，请分批导出。');
+      if (isGenerating(answer)) throw new Error('回答仍在生成，请完成后选择。');
+      const clone = cloneAnswerContent(answerContent(answer));
+      const characters = this.snapshotSize(clone);
+      const turn = answer.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid')?.match(/^conversation-turn-(\d+)$/);
+      const pending = [...answer.querySelectorAll(codeBlockSelector)].some(block => !ownedCodeSource(block))
+        || [...answer.querySelectorAll('[data-d-component="image"]')].some(image => !image.querySelector('img[src]'));
+      const entry: SelectedAnswer = { id, source: answer, clone, characters, pending, position: turn ? Number(turn[1]) : null };
+      this.selected.set(id, entry); this.selectionVersion++; this.updateTray();
+      if (!pending) return;
+      const route = pageRoute(), generation = this.generation;
+      const retained = () => !this.closed && this.selected.get(id) === entry && pageRoute() === route && this.generation === generation;
+      const current = () => retained() && answer.isConnected && !isGenerating(answer) && this.selectionKey(answer) === id;
+      this.selectionQueue = this.selectionQueue.then(async () => {
+        try {
+          if (!current()) return;
+          await this.revealImages([answerContent(answer)], current, status);
+          if (!current()) return;
+          const sources = await captureCodeSources([answerContent(answer)], current, () => { status.textContent = '正在加载回答中的代码…'; });
+          if (!current()) return;
+          const complete = cloneAnswerContent(answerContent(answer), sources);
+          const size = this.snapshotSize(complete, entry);
+          entry.clone = complete; entry.characters = size;
+        } catch (error) {
+          // Keep the initial copy if a lazy source cannot be read. Extraction
+          // retains its explicit missing-code/image marker rather than hiding it.
+          if (retained()) status.textContent = error instanceof Error ? error.message : String(error);
+        } finally { entry.pending = false; clearPreparingStatus(status); if (retained()) this.updateTray(); }
+      });
+    } catch (error) { check.checked = false; status.textContent = error instanceof Error ? error.message : String(error); }
+  }
   private clearSelection(): void {
-    this.selected.clear();
+    this.selected.clear(); this.selectionVersion++;
     for (const entry of this.entries.values()) { const check = entry.host.shadowRoot?.querySelector<HTMLInputElement>('input[type="checkbox"]'); if (check) check.checked = false; }
     this.updateTray();
   }
   private updateTray(): void {
-    this.tray?.remove(); this.tray = null;
-    if (!this.selected.size || this.closed) return;
+    if (!this.selected.size || this.closed) { this.tray?.remove(); this.tray = null; this.trayState = null; return; }
+    const waiting = [...this.selected.values()].filter(item => item.pending).length;
+    if (this.tray && this.trayState) {
+      this.trayState.label.textContent = `已选 ${this.selected.size} 条${waiting ? ` · 准备中 ${waiting} 条` : ''}`;
+      this.trayState.actions.forEach(action => { action.disabled = this.trayState!.pending || (waiting > 0 && action.textContent !== '清空选择'); }); return;
+    }
     const host = node('div'); host.setAttribute(UI_ATTRIBUTE, 'selection');
     host.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483000;width:auto;max-width:calc(100vw - 40px)';
     const shadow = host.attachShadow({ mode: 'open' }); shadow.append(node('style', style + '.bar{background:light-dark(#fff,#202938);padding:12px;border:1px solid #7f9f98;border-radius:12px;box-shadow:0 6px 28px #0003;margin:0}.status{max-width:400px}'));
-    const bar = node('div'); bar.className = 'bar'; bar.append(node('span', `已选 ${this.selected.size} 条`));
+    const bar = node('div'); bar.className = 'bar'; const label = node('span', `已选 ${this.selected.size} 条${waiting ? ` · 准备中 ${waiting} 条` : ''}`); bar.append(label);
+    bar.title = '保存勾选时的内容，滚动离开后仍可导出；刷新或切换对话会清空。';
     const status = node('div'); status.className = 'status'; status.setAttribute('role', 'status');
-    let pending = false;
     const run = async (kind: 'download' | 'copy' | 'preview' | 'pdf') => {
-      if (pending) return;
-      const route = location.href; const generation = this.generation;
-      const answers = answerElements().filter(answer => this.selected.has(answer));
-      const keys = answers.map(answer => answerKey(answer));
+      if (!this.trayState || this.trayState.pending || [...this.selected.values()].some(item => item.pending)) return;
+      const state = this.trayState;
+      const route = pageRoute(); const generation = this.generation;
+      const version = this.selectionVersion;
+      const entries = [...this.selected.values()].sort((a, b) => a.position !== null && b.position !== null ? a.position - b.position : this.selectionOrder.indexOf(a.id) - this.selectionOrder.indexOf(b.id));
       let snapshot: ExportSnapshot | undefined;
-      const current = () => !this.closed && this.snapshotCurrent(snapshot) && host.isConnected && location.href === route && this.generation === generation
-        && answers.every((answer, index) => answer.isConnected && this.selected.has(answer) && answerKey(answer) === keys[index] && !isGenerating(answer));
-      pending = true; actions.forEach(action => { action.disabled = true; });
+      const current = () => !this.closed && this.snapshotCurrent(snapshot) && host.isConnected && pageRoute() === route && this.generation === generation
+        && this.selectionVersion === version && entries.every(entry => this.selected.get(entry.id) === entry && (!entry.source.isConnected || !isGenerating(entry.source)));
+      state.pending = true; actions.forEach(action => { action.disabled = true; });
       try {
-        if (!answers.length) throw new Error('选中的回答已离开页面，请重新选择。');
-        if (answers.some(answer => isGenerating(answer))) throw new Error('选中的回答仍在生成，请完成后导出。');
-        await this.revealImages(answers.map(answerContent), current, status); if (!current()) return;
-        const codeSources = await captureCodeSources(answers.map(answerContent), current, () => { status.textContent = '正在加载回答中的代码…'; }); if (!current()) return;
-        snapshot = this.watchSnapshot(answers.map(answerContent));
-        const results = await this.capture(answers.map(answerContent), current, codeSources); if (!current()) return;
+        if (!entries.length) throw new Error('请先选择要导出的回答。');
+        snapshot = this.watchSnapshot(entries.map(entry => entry.source), true);
+        const results = await this.renderClones(entries.map(entry => entry.clone.cloneNode(true) as Element), current); if (!current()) return;
         const combined: ExportResult = {
           markdown: results.map(item => item.markdown).join('\n---\n\n'),
-          diagnostics: [{code:'LOADED_SELECTION',severity:'info',message:`本次仅含按页面顺序选中的 ${answers.length} 条已加载回答。`}, ...results.flatMap(item => item.diagnostics)],
+          diagnostics: [{code:'LOADED_SELECTION',severity:'info',message:`本次包含按对话顺序选中的 ${entries.length} 条回答快照；保存的是勾选时的内容。`}, ...results.flatMap(item => item.diagnostics)],
           formulas: results.flatMap(item => item.formulas), codeBlocks: results.flatMap(item => item.codeBlocks),
         };
         status.textContent = '正在准备所选内容和图片…';
@@ -283,20 +363,27 @@ class ExportControls {
           catch { if (current()) { status.textContent = '复制受限，请在预览源码页手动复制。'; await this.preview(result); } }
         }
       } catch (error) { if (current()) status.textContent = error instanceof Error ? error.message : String(error); }
-      finally { if (snapshot) this.snapshots.delete(snapshot); clearPreparingStatus(status); pending = false; actions.forEach(action => { action.disabled = false; }); }
+      finally { if (snapshot) this.snapshots.delete(snapshot); clearPreparingStatus(status); state.pending = false; this.updateTray(); }
     };
     const actions = [button('下载 Markdown', () => { void run('download'); }), button('复制', () => { void run('copy'); }), button('预览', () => { void run('preview'); }), button('导出 PDF', () => { void run('pdf'); }), button('清空选择', () => this.clearSelection())];
     bar.append(...actions, status);
-    shadow.append(bar); document.body.append(host); this.tray = host;
+    shadow.append(bar); document.body.append(host); this.tray = host; this.trayState = { label, status, actions, pending: false };
+    actions.forEach(action => { action.disabled = waiting > 0 && action.textContent !== '清空选择'; });
   }
   private async preview(result: ReadyExport): Promise<boolean> {
     this.modalHost?.remove();
     const host = node('div'); host.setAttribute(UI_ATTRIBUTE, 'preview'); document.body.append(host); this.modalHost = host;
-    const shadow = host.attachShadow({ mode: 'open' }); shadow.append(node('style', style + previewImageStyle + mathStyles() + documentCss));
+    const shadow = host.attachShadow({ mode: 'open' }); shadow.append(node('style', style + previewImageStyle + mathStyles() + documentCss + appearanceCss));
     const dialog = node('dialog'); const header = node('div'); header.className = 'head';
     const title = node('div'); title.append(node('div', 'Markdown 预览')); title.firstElementChild!.className = 'title';
     const subtitle = node('div', `${result.formulas.length} 个公式 · ${result.codeBlocks.length} 个代码块 · 本地处理`); subtitle.className = 'sub'; title.append(subtitle);
     const actions = node('div'); actions.className = 'actions'; const body = node('div'); body.className = 'body'; body.textContent = '正在渲染…';
+    const documentView = node('article'); documentView.className = 'document';
+    const updateAppearance = (value: ReturnType<typeof readAppearance>) => {
+      applyAppearance(documentView, value); dialog.style.width = `min(${value.contentWidth + 80}px, 94vw)`;
+    };
+    updateAppearance(this.appearance);
+    const appearance = appearanceControls(document, this.appearance, value => { this.appearance = value; saveAppearance(value); updateAppearance(value); });
     // Native fragment navigation cannot resolve IDs inside a shadow root.
     body.addEventListener('click', event => {
       const link = event.target instanceof Element ? event.target.closest('a[href^="#"]') : null;
@@ -310,7 +397,7 @@ class ExportControls {
     });
     const close = () => { dialog.close(); host.remove(); if (this.modalHost === host) this.modalHost = null; };
     let source = false; let html = '';
-    const view = button('查看源码', () => { source = !source; view.textContent = source ? '查看预览' : '查看源码'; body.replaceChildren(); if (source) { const area = node('textarea'); area.readOnly = true; area.value = result.markdown; area.setAttribute('aria-label', 'Markdown 源码'); body.append(area); } else body.innerHTML = html; });
+    const view = button('查看源码', () => { source = !source; view.textContent = source ? '查看预览' : '查看源码'; body.replaceChildren(); if (source) { const area = node('textarea'); area.readOnly = true; area.value = result.markdown; area.setAttribute('aria-label', 'Markdown 源码'); body.append(area); } else { documentView.innerHTML = html; body.append(documentView); } });
     actions.append(view, button('复制', () => { void copy(result).then(() => { notes.hidden = false; feedback.textContent = '已复制 Markdown'; }).catch(() => { notes.hidden = false; feedback.textContent = '请切到源码页手动复制。'; }); }), button('下载', () => download(result)), button('导出 PDF', () => { void this.print(result).catch(error => { notes.hidden = false; feedback.textContent = String(error); }); }), button('关闭', close));
     header.append(title, actions); const notes = node('div'); notes.className = 'notes'; const feedback = node('span'); feedback.setAttribute('role', 'status');
     notes.hidden = !result.diagnostics.length && !result.formulas.length; notes.append(feedback); for (const item of result.diagnostics) notes.append(node('div', item.message));
@@ -322,11 +409,11 @@ class ExportControls {
         const raw = node('pre', formula.rawSource || '页面未保留可确认的公式源码。'); raw.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 Consolas,monospace;margin:5px 0 12px'; details.append(raw);
       }); notes.append(details);
     }
-    const foot = node('div', '预览读取的就是导出 Markdown。仅含本次选择的已加载回答；页面未保留的原始写法无法恢复。'); foot.className = 'foot';
-    dialog.append(header, notes, body, foot); shadow.append(dialog); dialog.addEventListener('cancel', close); dialog.showModal();
+    const foot = node('div', '预览读取导出 Markdown；多选保留勾选时的内容。字号和阅读宽度用于预览与 PDF，Markdown 阅读器可自行设置。'); foot.className = 'foot';
+    dialog.append(header, appearance, notes, body, foot); shadow.append(dialog); dialog.addEventListener('cancel', close); dialog.showModal();
     const rendered = await renderPreview(result.markdown, { imageAssets: result.assets?.imageAssets });
     if (!host.isConnected || this.modalHost !== host) return false;
-    html = rendered.html; if (!source) body.innerHTML = html;
+    html = rendered.html; documentView.innerHTML = html; if (!source) body.replaceChildren(documentView);
     if (rendered.diagnostics.length) notes.hidden = false;
     for (const item of rendered.diagnostics) notes.append(node('div', item.message));
     return true;

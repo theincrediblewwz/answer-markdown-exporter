@@ -3,4 +3,6 @@
 /* Chromium 130+: remove space for automatic browser headers/footers, then
    clone the original content padding on every printed page fragment. */
 @page{margin-top:0;margin-bottom:0}
+/* Respect the user's paper size and orientation instead of forcing portrait. */
+@page{size:auto}
 @media print{#print-content{padding:16mm 0 18mm;-webkit-box-decoration-break:clone;box-decoration-break:clone}}

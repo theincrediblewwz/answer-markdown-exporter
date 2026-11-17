@@ -46,6 +46,15 @@ test('print broker only accepts its own GPT top-frame content sender', async () 
   } finally { instance.dispose(); }
 });
 
+test('print appearance travels with the payload and only bounded font options reach the page', async () => {
+  const instance = broker();
+  try {
+    await instance.send(request({ appearance: { font: 'serif', fontSize: 24, contentWidth: 960 } }));
+    const reply = await instance.send({ type: 'gpt-md:print-payload', token }, printSender());
+    assert.deepEqual(reply.payload.appearance, { font: 'serif', fontSize: 24, contentWidth: 960 });
+  } finally { instance.dispose(); }
+});
+
 test('print payload remains exact and reloadable from only the matching local print page', async () => {
   const instance = broker();
   const markdown = '# 标题\n\n```python\n\tif value:\n    print(value)\n\n```\n';
@@ -188,6 +197,21 @@ async function withPrintPage(options: {
   try { page.window.eval(await printBundle);await run(page, state);assert.deepEqual(errors, []); }
   finally { page.window.close(); }
 }
+
+test('print typography can be adjusted without rewriting the Markdown or its code', async () => {
+  const payload: PrintPayload = { markdown: '# Keep source\n', imageAssets: {}, diagnostics: [], appearance: { font: 'serif', fontSize: 22, contentWidth: 640 } };
+  await withPrintPage({ payload }, async (page, state) => {
+    await eventually(() => state.prints === 1);
+    const content = page.window.document.querySelector<HTMLElement>('#print-content')!;
+    assert.equal(content.style.fontSize, '22px'); assert.equal(content.style.maxWidth, '640px');
+    const oldCode = content.querySelector('code')!.textContent;
+    const size = page.window.document.querySelector<HTMLInputElement>('[aria-label="正文字号"]')!;
+    size.value = '26'; size.dispatchEvent(new page.window.Event('change'));
+    assert.equal(content.style.fontSize, '26px');
+    assert.equal(content.querySelector('code')!.textContent, oldCode);
+    assert.equal(payload.markdown, '# Keep source\n');
+  });
+});
 
 test('print page renders final Markdown with its assets, keeps table/code structure and auto-prints once', async () => {
   const payload: PrintPayload = { markdown: '# Exact source\n\n    keep indentation\n', imageAssets: { 'images/a.png': image }, diagnostics: [{ code: 'note', severity: 'info', message: 'Export note' }] };

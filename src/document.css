@@ -1,4 +1,9 @@
 /* Document-owned rules shared by preview and print. No page styles are copied. */
+.body table,#print-content table{font-size:inherit}
+.body table:not(.gpt-md-layout){width:fit-content;max-width:100%}
+#print-content table:not(.gpt-md-layout){width:auto;max-width:100%}
+.body>.document{overflow-wrap:anywhere}
+dialog>.appearance{flex-shrink:0}
 .gpt-md-layout-scroll{max-width:100%;overflow-x:auto;margin:14px 0}
 table.gpt-md-layout{display:table!important;width:100%;min-width:420px;border-collapse:separate!important;border-spacing:8px;table-layout:fixed!important;margin:0!important}
 table.gpt-md-layout>tbody>tr>td{border:0!important;vertical-align:middle!important;text-align:center;padding:8px!important}
@@ -38,6 +43,7 @@ table.gpt-md-plain-row .gpt-md-group,table.gpt-md-plain-row p{margin:0}
 table.gpt-md-layout.gpt-md-meter-row{border-spacing:0}
 table.gpt-md-layout.gpt-md-meter-row>tbody>tr>td.gpt-md-plain-cell{padding:0 2px!important}
 table.gpt-md-layout.gpt-md-meter-row>tbody>tr>td>p{margin:0;line-height:1.4}
+table.gpt-md-layout.gpt-md-meter-row>tbody>tr>td[width]{width:4em}
 .body pre{max-width:100%;tab-size:4;overflow-wrap:normal;word-break:normal;direction:ltr}
 .body code.gpt-md-inline-code,#print-content code.gpt-md-inline-code{white-space:pre-wrap;tab-size:4}
 @media print{.gpt-md-layout-scroll{overflow:visible;break-inside:avoid-page}table.gpt-md-layout{min-width:0}.gpt-md-layout-scroll img{max-height:220mm}}

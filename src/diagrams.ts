@@ -1,4 +1,5 @@
 import type { Diagnostic } from './types';
+import { citationDecoration } from './image-policy';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const XML_NS = 'http://www.w3.org/XML/1998/namespace';
@@ -472,6 +473,7 @@ export async function prepareDiagramImages(root: Element, options: { signal?: Ab
     visibility.set(element, result); return result;
   };
   const candidates = [...root.querySelectorAll('svg,img,canvas')].filter(element => {
+    if (citationDecoration(element)) return false;
     if (element.closest(excluded) || element.closest(ignoredAnswerContent) || hidden(element)) return false;
     // Original-image zoom buttons contribute their actual IMG only.
     if (element.closest('button') && element.localName !== 'img') return false;
